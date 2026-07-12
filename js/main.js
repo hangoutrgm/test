@@ -10,14 +10,12 @@ const presenceSessionId = `posts_${crypto.randomUUID?.() || `${Date.now()}_${Mat
 const presenceSessionRef = (uid) => ref(db, `presence/${uid}/${presenceSessionId}`);
 function startOwnPresence(user = auth.currentUser) {
     if (!user) return;
-    if (document.visibilityState !== 'visible') return;
     const sessionRef = presenceSessionRef(user.uid);
     onDisconnect(sessionRef).remove();
     set(sessionRef, true);
 }
 function stopOwnPresence(user = auth.currentUser) {
-    if (user) return remove(presenceSessionRef(user.uid));
-    return Promise.resolve();
+    if (user) remove(presenceSessionRef(user.uid));
 }
 
 // ==========================================
@@ -884,21 +882,6 @@ onAuthStateChanged(auth, (user) => {
     }
     if(!window.activeProfileUid) window.renderFeed(false);
 });
-
-// Presence visibility handling for PWA background/foreground
-function setupPresenceVisibilityHandlers() {
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      stopOwnPresence(window.currentUser);
-    } else {
-      startOwnPresence(window.currentUser);
-    }
-  });
-  window.addEventListener('pagehide', () => stopOwnPresence(window.currentUser));
-  window.addEventListener('pageshow', () => startOwnPresence(window.currentUser));
-  window.addEventListener('beforeunload', () => stopOwnPresence(window.currentUser));
-}
-setupPresenceVisibilityHandlers();
 
 // ==========================================
 // PWA INSTALLATION LOGIC
