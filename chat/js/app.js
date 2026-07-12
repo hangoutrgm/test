@@ -255,7 +255,7 @@ async function startGroupConversation(peerIds) {
     const members = { [state.user.uid]: true };
     peerIds.forEach(id => members[id] = true);
     const now = Date.now();
-    await set(ref(db, `chatThreads/${threadId}`), { members, isGroup: true, createdAt: now, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid });
+    await set(ref(db, `chatThreads/${threadId}`), { members, isGroup: true, creatorId: state.user.uid, createdAt: now, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid });
     const summary = { isGroup: true, members, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid, unreadCount: 0 };
     await set(ref(db, `chatInboxes/${state.user.uid}/${threadId}`), summary);
     peerIds.forEach(id => runTransaction(ref(db, `chatInboxes/${id}/${threadId}`), (current) => current || summary).catch(()=>{}));
@@ -391,8 +391,8 @@ function syncThreadSummaryWatchers() {
     state.stopThreadSummaries[threadId] = onValue(ref(db, `chatThreads/${threadId}`), (snapshot) => {
       const thread = snapshot.val(); const current = state.inbox[threadId];
       if (!thread || !current || Number(thread.lastTimestamp || 0) < Number(current.lastTimestamp || 0)) return;
-      const next = { ...current, lastMessage: thread.lastMessage || '', lastTimestamp: thread.lastTimestamp || 0, lastSenderId: thread.lastSenderId || '', nicknames: thread.nicknames || {}, members: thread.members || {} };
-      if (next.lastMessage === current.lastMessage && next.lastTimestamp === current.lastTimestamp && next.lastSenderId === current.lastSenderId && JSON.stringify(next.nicknames) === JSON.stringify(current.nicknames || {})) return;
+      const next = { ...current, lastMessage: thread.lastMessage || '', lastTimestamp: thread.lastTimestamp || 0, lastSenderId: thread.lastSenderId || '', nicknames: thread.nicknames || {}, members: thread.members || {}, creatorId: thread.creatorId || current.creatorId || '', name: thread.name || current.name || '' };
+      if (next.lastMessage === current.lastMessage && next.lastTimestamp === current.lastTimestamp && next.lastSenderId === current.lastSenderId && JSON.stringify(next.nicknames) === JSON.stringify(current.nicknames || {}) && next.name === (current.name || '') && JSON.stringify(next.members) === JSON.stringify(current.members || {})) return;
       state.inbox = { ...state.inbox, [threadId]: next };
       if (state.activeThreadId === threadId) { state.activeInboxItem = next; updateChatHeader(); renderMessages(state.messages); }
       renderConversations();
@@ -428,7 +428,23 @@ $('conversation-search').addEventListener('input', renderConversations); $('peop
 $('message-input').addEventListener('input', (event) => { event.target.style.height = 'auto'; event.target.style.height = `${Math.min(event.target.scrollHeight, 120)}px`; if (event.target.value.trim()) noteTyping(); else setTyping(false); });
 $('message-input').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('message-form').requestSubmit(); } });
 $('image-input').addEventListener('change', (event) => { const file = event.target.files[0]; state.pendingImageFile = file || null; if (file) showToast(`Photo ready: ${file.name}. Limit: 3 uploads daily.`); });
-$('cancel-reply-button').addEventListener('click', clearReply); $('mobile-back-button').addEventListener('click', closeActiveChat); $('conversation-options-button').addEventListener('click', () => $('conversation-dialog').showModal()); $('close-conversation-dialog').addEventListener('click', () => $('conversation-dialog').close()); $('clear-chat-button').addEventListener('click', clearChatForMe); $('remove-conversation-button').addEventListener('click', removeConversation);
+$('cancel-reply-button').addEventListener('click', clearReply);
+$('mobile-back-button').addEventListener('click', closeActiveChat);
+$('conversation-options-button').addEventListener('click', () => {
+  const isGroup = state.activeInboxItem?.isGroup;
+  const isCreator = isGroup && state.activeInboxItem?.creatorId === state.user?.uid;
+  $('set-nickname-button').classList.toggle('hidden', isGroup);
+  $('rename-group-button').classList.toggle('hidden', !isGroup);
+  $('kick-member-button').classList.toggle('hidden', !isCreator);
+  $('leave-group-button').classList.toggle('hidden', !isGroup);
+  $('conversation-dialog').showModal();
+});
+$('close-conversation-dialog').addEventListener('click', () => $('conversation-dialog').close());
+$('clear-chat-button').addEventListener('click', clearChatForMe);
+$('remove-conversation-button').addEventListener('click', removeConversation);
+$('rename-group-button')?.addEventListener('click', renameGroup);
+$('kick-member-button')?.addEventListener('click', kickMember);
+$('leave-group-button')?.addEventListener('click', leaveGroup);
 $('close-auth-button').addEventListener('click', () => $('auth-dialog').close());
 
 $('toggle-group-mode')?.addEventListener('click', () => {
@@ -444,14 +460,8 @@ $('start-group-btn')?.addEventListener('click', () => {
 $('set-nickname-button')?.addEventListener('click', async () => {
   if (!state.user || !state.activeThreadId) return;
   const peerIds = getThreadPeers(state.activeInboxItem);
-  const uids = [state.user.uid, ...peerIds];
-  let targetUid = peerIds[0];
-  if (state.activeInboxItem.isGroup) {
-    const names = uids.map(id => `${id === state.user.uid ? 'You' : state.users[id]?.name} (ID: ${id})`).join('\n');
-    const input = window.prompt(`Enter the ID of the person to nickname:\n${names}`);
-    if (!input || !uids.includes(input.trim())) return;
-    targetUid = input.trim();
-  }
+  const targetUid = peerIds[0];
+  if (!targetUid) return;
   const currentNick = getNickname(targetUid);
   const realName = state.users[targetUid]?.name || 'Member';
   const nick = window.prompt(`Enter nickname for ${realName}:`, currentNick === realName ? '' : currentNick);
@@ -462,6 +472,49 @@ $('set-nickname-button')?.addEventListener('click', async () => {
     showToast('Nickname updated.');
   } catch (err) { showToast('Could not update nickname.'); }
 });
+
+async function renameGroup() {
+  if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
+  const current = state.activeInboxItem.name || getThreadName(state.activeInboxItem, getThreadPeers(state.activeInboxItem));
+  const newName = window.prompt('Enter a new group name:', current);
+  if (newName === null || !newName.trim()) return;
+  try {
+    await update(ref(db, `chatThreads/${state.activeThreadId}`), { name: newName.trim() });
+    $('conversation-dialog').close();
+    showToast('Group renamed.');
+  } catch (err) { showToast(`Could not rename group: ${err.message}`); }
+}
+
+async function kickMember() {
+  if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
+  if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the group creator can kick members.');
+  const peerIds = getThreadPeers(state.activeInboxItem);
+  if (!peerIds.length) return showToast('No members to kick.');
+  const names = peerIds.map(id => `${state.users[id]?.name || 'Member'} — ${id}`).join('\n');
+  const input = window.prompt(`Enter the name or ID of the member to kick:\n\n${names}`);
+  if (!input) return;
+  const targetUid = peerIds.find(id => id === input.trim() || (state.users[id]?.name || '').toLowerCase() === input.trim().toLowerCase());
+  if (!targetUid) return showToast('Member not found. Please enter their exact name or ID.');
+  if (!window.confirm(`Kick ${state.users[targetUid]?.name || 'this member'} from the group?`)) return;
+  try {
+    await update(ref(db, `chatThreads/${state.activeThreadId}/members`), { [targetUid]: null });
+    await remove(ref(db, `chatInboxes/${targetUid}/${state.activeThreadId}`));
+    $('conversation-dialog').close();
+    showToast(`${state.users[targetUid]?.name || 'Member'} was kicked.`);
+  } catch (err) { showToast(`Could not kick member: ${err.message}`); }
+}
+
+async function leaveGroup() {
+  if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
+  if (!window.confirm('Leave this group chat?')) return;
+  try {
+    await update(ref(db, `chatThreads/${state.activeThreadId}/members`), { [state.user.uid]: null });
+    await remove(ref(db, `chatInboxes/${state.user.uid}/${state.activeThreadId}`));
+    $('conversation-dialog').close();
+    closeActiveChat();
+    showToast('You have left the group.');
+  } catch (err) { showToast(`Could not leave group: ${err.message}`); }
+}
 $('auth-toggle').addEventListener('click', () => { state.signUp = !state.signUp; $('auth-title').textContent = state.signUp ? 'Create account' : 'Sign in'; $('auth-submit').textContent = state.signUp ? 'Create account' : 'Sign in'; $('auth-toggle').textContent = state.signUp ? 'Already have an account? Sign in' : 'Need an account? Create one'; $('auth-password').autocomplete = state.signUp ? 'new-password' : 'current-password'; });
 $('auth-form').addEventListener('submit', async (event) => { event.preventDefault(); const email = $('auth-email').value.trim(); const password = $('auth-password').value; const error = $('auth-error'); error.classList.add('hidden'); try { const result = state.signUp ? await createUserWithEmailAndPassword(auth, email, password) : await signInWithEmailAndPassword(auth, email, password); if (state.signUp) { const name = `User_${Math.floor(Math.random() * 999)}`; const pic = fallbackAvatar(result.user.uid); await updateProfile(result.user, { displayName: name, photoURL: pic }); await update(ref(db, `users/${result.user.uid}`), { uid: result.user.uid, name, pic }); } $('auth-dialog').close(); } catch (err) { error.textContent = err.message.replace('Firebase: ', ''); error.classList.remove('hidden'); } });
 document.addEventListener('pointerdown', (event) => { if (!event.target.closest('#message-action-menu') && !event.target.closest('.message-bubble')) closeMessageMenu(); });
