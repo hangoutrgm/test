@@ -857,9 +857,6 @@ window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     // Stash the event so it can be triggered later.
     deferredPrompt = e;
-    // Update UI to notify the user they can install the PWA
-    const installBtn = document.getElementById('install-pwa-btn');
-    if(installBtn) installBtn.classList.remove('hidden');
 });
 
 document.getElementById('install-pwa-btn')?.addEventListener('click', async () => {
@@ -868,11 +865,17 @@ document.getElementById('install-pwa-btn')?.addEventListener('click', async () =
         const { outcome } = await deferredPrompt.userChoice;
         if (outcome === 'accepted') {
             console.log('User accepted the install prompt');
-            document.getElementById('install-pwa-btn').classList.add('hidden');
         } else {
             console.log('User dismissed the install prompt');
         }
         deferredPrompt = null;
+    } else {
+        // Fallback if the event hasn't fired or app is already installed
+        if (window.showAlert) {
+            window.showAlert("To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.");
+        } else {
+            alert("To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.");
+        }
     }
 });
 
