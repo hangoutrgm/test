@@ -298,18 +298,20 @@ async function updateConversationSummaries(preview, timestamp) {
     [`chatInboxes/${state.user.uid}/${state.activeThreadId}`]: own
   });
   const peerIds = getThreadPeers(state.activeInboxItem);
+  const isGroup = state.activeInboxItem?.isGroup;
   peerIds.forEach(id => {
     runTransaction(ref(db, `chatInboxes/${id}/${state.activeThreadId}`), (current) => {
-      const next = current || { ...own };
-      if (!state.activeInboxItem?.isGroup) next.peerId = state.user.uid;
-      next.lastMessage = preview; next.lastTimestamp = timestamp; next.lastSenderId = state.user.uid;
-      next.unreadCount = Math.min(Number(next.unreadCount || 0) + 1, 99);
-      return next;
+      const base = { ...(current || own) };
+      if (isGroup) { base.isGroup = true; base.members = state.activeInboxItem.members || own.members || {}; delete base.peerId; }
+      else { base.peerId = state.user.uid; }
+      base.lastMessage = preview; base.lastTimestamp = timestamp; base.lastSenderId = state.user.uid;
+      base.unreadCount = Math.min(Number(base.unreadCount || 0) + 1, 99);
+      return base;
     }).catch(()=>{});
   });
 }
 async function sendMessage(event) {
-  event.preventDefault(); if (!state.user || !state.activeThreadId || !state.activePeerId) return;
+  event.preventDefault(); if (!state.user || !state.activeThreadId) return;
   const input = $('message-input'); const text = input.value.trim(); const file = state.pendingImageFile; if (!text && !file) return;
   const button = $('send-button'); button.disabled = true;
   try {
