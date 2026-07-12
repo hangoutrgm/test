@@ -93,11 +93,31 @@ window.copyProfileLink = function(uid) {
 window.viewImage = (src) => {
     document.getElementById('viewer-img').src = src;
     document.getElementById('image-viewer-modal').classList.remove('hidden');
+    
+    // Attempt to fetch image as blob to allow download for cross-origin images
+    const downloadBtn = document.getElementById('viewer-download-btn');
+    downloadBtn.href = '#';
+    fetch(src)
+        .then(res => res.blob())
+        .then(blob => {
+            const blobUrl = URL.createObjectURL(blob);
+            downloadBtn.href = blobUrl;
+        })
+        .catch(() => {
+            // Fallback: just link directly (may open new tab for cross-origin)
+            downloadBtn.href = src;
+        });
 };
 
 window.closeImageViewer = () => {
+    const downloadBtn = document.getElementById('viewer-download-btn');
+    // Revoke any blob URL to free memory
+    if (downloadBtn.href && downloadBtn.href.startsWith('blob:')) {
+        URL.revokeObjectURL(downloadBtn.href);
+    }
     document.getElementById('image-viewer-modal').classList.add('hidden');
     document.getElementById('viewer-img').src = '';
+    downloadBtn.href = '#';
 };
 
 window.compressImage = (file, heavy = false) => {
@@ -220,14 +240,11 @@ window.notifyMentions = (text, postId) => {
 };
 
 window.isPostPinned = (post, filterContext) => {
-    // Check for new pin fields
-    if (post.pinnedProfile) return true; // pinned to profile, show universally
-    if (post.pinnedFeed) return true; // pinned to feed, show universally
-    // Legacy field fallback
-    if (post.pinned) return true;
+    if (!post.pinned) return false;
     const roleLevel = window.getRole(post.authorId).level;
-    if (roleLevel >= 2) return true;
-    if (filterContext === 'Games' || filterContext === 'profile') return true;
+    
+    if (roleLevel >= 2) return true; 
+    if (filterContext === 'Games' || filterContext === 'profile') return true; 
     return false;
 };
 
@@ -239,45 +256,9 @@ window.deleteItem = (dbPath, targetUid) => {
     });
 }
 
-window.togglePin = (postId, currentStatus, authorId, scope = 'profile') => {
+window.togglePin = (postId, currentStatus, authorId) => {
     if (window.currentUser && (window.getRole(window.currentUser.uid).level >= 2 || window.currentUser.uid === authorId)) {
-        const updates = {};
-        if (scope === 'profile') {
-            updates.pinnedProfile = !currentStatus;
-        } else if (scope === 'feed') {
-            updates.pinnedFeed = !currentStatus;
-        }
-        update(ref(db, `community_posts/${postId}`), updates);
-    }
-};
-
-window.openPinModal = (postId) => {
-    // Find the post object
-    const post = window.allPosts.find(p => p.id === postId);
-    if (!post) return window.showAlert('Post not found');
-
-    // Determine current pin status for each scope
-    const isPinnedProfile = !!post.pinnedProfile;
-    const isPinnedFeed = !!post.pinnedFeed;
-
-    // Show the modal
-    const modal = document.getElementById('pin-modal');
-    if (modal) modal.classList.remove('hidden');
-
-    // Set up button handlers
-    const profileBtn = document.getElementById('pin-profile-btn');
-    const feedBtn = document.getElementById('pin-feed-btn');
-    if (profileBtn) {
-        profileBtn.onclick = () => {
-            window.togglePin(postId, isPinnedProfile, post.authorId, 'profile');
-            if (modal) modal.classList.add('hidden');
-        };
-    }
-    if (feedBtn) {
-        feedBtn.onclick = () => {
-            window.togglePin(postId, isPinnedFeed, post.authorId, 'feed');
-            if (modal) modal.classList.add('hidden');
-        };
+        update(ref(db, `community_posts/${postId}`), { pinned: !currentStatus });
     }
 };
 
