@@ -64,9 +64,10 @@
   </div>
 
   <dialog id="people-dialog" class="dialog">
-    <form method="dialog" class="dialog-card">
+    <form method="dialog" class="dialog-card" id="people-form">
       <header class="dialog-header">
-        <h2>New message</h2>
+        <h2 id="people-dialog-title">New message</h2>
+        <button type="button" id="toggle-group-mode" class="text-button" style="margin-left: auto; margin-right: 10px;">Group</button>
         <button class="icon-button" value="cancel" aria-label="Close">×</button>
       </header>
       <label class="search-box dialog-search">
@@ -74,6 +75,9 @@
         <input id="people-search" type="search" autocomplete="off" placeholder="Search members">
       </label>
       <div id="people-list" class="people-list"></div>
+      <div id="group-action-bar" class="hidden" style="padding-top: 10px;">
+        <button id="start-group-btn" class="button primary-button" type="button" style="width:100%">Start Group Chat</button>
+      </div>
     </form>
   </dialog>
 
@@ -98,8 +102,9 @@
         <h2>Conversation options</h2>
         <button id="close-conversation-dialog" type="button" class="icon-button" aria-label="Close">×</button>
       </header>
+      <button id="set-nickname-button" class="conversation-action" type="button"><span>Set Nicknames</span><small>Change how members appear in this chat.</small></button>
       <button id="clear-chat-button" class="conversation-action" type="button"><span>Clear messages for me</span><small>Hides this chat’s existing messages only on this account.</small></button>
-      <button id="remove-conversation-button" class="conversation-action danger" type="button"><span>Remove conversation</span><small>Removes it from your inbox. The other member keeps their copy.</small></button>
+      <button id="remove-conversation-button" class="conversation-action danger" type="button"><span>Remove conversation</span><small>Removes it from your inbox. Other members keep their copy.</small></button>
     </section>
   </dialog>
 
