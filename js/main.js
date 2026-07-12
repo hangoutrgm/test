@@ -864,8 +864,8 @@ document.getElementById('install-pwa-btn')?.addEventListener('click', async () =
         if (outcome === 'accepted') console.log('User accepted the install prompt');
         deferredPrompt = null;
     } else {
-        if (window.showAlert) window.showAlert(To install Hangout, tap your browser's menu (?) and select 'Install app' or 'Add to Home screen'.);
-        else alert(To install Hangout, tap your browser's menu (?) and select 'Install app' or 'Add to Home screen'.);
+        if (window.showAlert) window.showAlert(`To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.`);
+        else alert(`To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.`);
     }
 });
 
