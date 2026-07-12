@@ -102,8 +102,14 @@
         <h2>Conversation options</h2>
         <button id="close-conversation-dialog" type="button" class="icon-button" aria-label="Close">×</button>
       </header>
+      <!-- DM-only -->
       <button id="set-nickname-button" class="conversation-action" type="button"><span>Set Nicknames</span><small>Change how members appear in this chat.</small></button>
-      <button id="clear-chat-button" class="conversation-action" type="button"><span>Clear messages for me</span><small>Hides this chat’s existing messages only on this account.</small></button>
+      <!-- Group-only -->
+      <button id="rename-group-button" class="conversation-action hidden" type="button"><span>Rename Group</span><small>Change the group chat title.</small></button>
+      <button id="kick-member-button" class="conversation-action hidden" type="button"><span>Kick Member</span><small>Remove a member from this group.</small></button>
+      <button id="leave-group-button" class="conversation-action danger hidden" type="button"><span>Leave Group</span><small>Leave this group chat. You can rejoin if re-added.</small></button>
+      <!-- Common -->
+      <button id="clear-chat-button" class="conversation-action" type="button"><span>Clear messages for me</span><small>Hides this chat's existing messages only on this account.</small></button>
       <button id="remove-conversation-button" class="conversation-action danger" type="button"><span>Remove conversation</span><small>Removes it from your inbox. Other members keep their copy.</small></button>
     </section>
   </dialog>
