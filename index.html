@@ -127,6 +127,16 @@
             </div>
         </div>
     </div>
+<div id="pin-modal" class="hidden fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+    <div class="bg-white dark:bg-slate-800 rounded-xl w-full max-w-sm p-5 shadow-2xl relative border border-gray-200 dark:border-slate-700 flex flex-col items-center text-center transform transition-all">
+        <h2 class="text-lg font-bold mb-2 dark:text-white">Pin Post</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-300 mb-5">Choose where to pin this post:</p>
+        <div class="flex space-x-2 w-full justify-center">
+            <button id="pin-profile-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1.5 rounded-full text-xs font-bold">Pin to Profile</button>
+            <button id="pin-feed-btn" class="bg-green-600 hover:bg-green-500 text-white px-4 py-1.5 rounded-full text-xs font-bold">Pin to Feed</button>
+        </div>
+    </div>
+</div>
 
     <div id="image-viewer-modal" class="hidden fixed inset-0 z-[120] flex flex-col items-center justify-center p-2 bg-black/95 backdrop-blur-sm" onclick="window.closeImageViewer()">
         <button onclick="window.closeImageViewer()" class="absolute top-4 right-4 text-gray-400 hover:text-white z-10 transition p-2"><i class="fa-solid fa-xmark text-2xl"></i></button>
