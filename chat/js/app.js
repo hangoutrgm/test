@@ -6,7 +6,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   user: null, users: {}, inbox: {}, online: {}, clears: {}, typing: {}, messages: {}, activeThreadId: null, activeInboxItem: null,
   activePeerId: null, stopMessages: null, stopInbox: null, stopTyping: null, stopClears: null, stopSeen: null, stopThreadSummaries: {}, signUp: false,
-  replyTo: null, pendingImageFile: null, inboxReady: false, messagesLoaded: false, typingTimer: null, typingExpiryTimer: null, peerSeenAt: 0, connected: false,
+  replyTo: null, pendingImageFile: null, inboxReady: false, messagesLoaded: false, typingTimer: null, typingExpiryTimer: null, peerSeenAt: 0, groupSeenAt: {}, connected: false,
   groupMode: false, groupSelection: []
 };
 const reactions = { like: '👍', love: '❤️', laugh: '😂', wow: '😮', sad: '😢' };
@@ -54,6 +54,61 @@ function applyTheme(theme) {
   document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0b1320' : '#1877f2');
 }
 applyTheme(localStorage.getItem('hangout-chat-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+
+function showAppModal(options = {}) {
+  return new Promise((resolve) => {
+    const modal = $('app-modal');
+    if (modal.open) modal.close();
+    $('app-modal-title').textContent = options.title || 'Confirm';
+    const confirmBtn = $('app-modal-confirm');
+    const cancelBtn = $('app-modal-cancel');
+    confirmBtn.textContent = options.confirmText || 'Confirm';
+    cancelBtn.textContent = options.cancelText || 'Cancel';
+    confirmBtn.className = `app-modal-btn ${options.danger ? 'danger' : 'primary'}`;
+    let html = '';
+    if (options.message) html += `<p class="app-modal-message">${escapeHtml(options.message)}</p>`;
+    if (options.input) html += `<input id="app-modal-input" class="app-modal-input" type="text" value="${escapeHtml(options.inputValue || '')}" placeholder="${escapeHtml(options.placeholder || '')}">`;
+    if (options.memberList) {
+      html += `<label class="search-box app-modal-search"><span>⌕</span><input id="app-modal-search-input" type="search" autocomplete="off" placeholder="Search members"></label>`;
+      html += `<div id="app-modal-member-list" class="member-select-list"></div>`;
+    }
+    $('app-modal-body').innerHTML = html;
+    let selected = [];
+    if (options.memberList) {
+      const render = (term = '') => {
+        const el = $('app-modal-member-list');
+        const list = options.memberList.filter(m => !term || m.name.toLowerCase().includes(term));
+        el.innerHTML = list.length ? list.map(m => {
+          const on = selected.includes(m.uid);
+          const badge = m.isCreator ? `<span class="creator-badge" style="margin-left:auto; font-size:10px; background:var(--primary); color:#fff; padding:2px 6px; border-radius:8px;">Creator</span>` : '';
+          const disableCheck = m.uid === options.disabledUid ? ' disabled' : '';
+          return `<button class="member-select-item${on ? ' selected' : ''}" data-uid="${escapeHtml(m.uid)}" type="button" ${disableCheck}><img class="avatar" src="${escapeHtml(m.avatar)}" alt=""><span class="member-select-name">${escapeHtml(m.name)}</span>${badge}${options.multiSelect ? `<span class="member-select-check">${on ? '✓' : ''}</span>` : ''}</button>`;
+        }).join('') : '<p class="list-empty">No members found.</p>';
+        el.querySelectorAll('.member-select-item').forEach(b => b.addEventListener('click', () => {
+          const uid = b.dataset.uid;
+          if (options.multiSelect) { selected = selected.includes(uid) ? selected.filter(i => i !== uid) : [...selected, uid]; }
+          else { selected = selected[0] === uid ? [] : [uid]; }
+          render(term);
+        }));
+      };
+      render();
+      $('app-modal-search-input')?.addEventListener('input', e => render(e.target.value.trim().toLowerCase()));
+    }
+    let done = false;
+    const finish = (val) => { if (done) return; done = true; modal.close(); resolve(val); };
+    confirmBtn.onclick = () => finish(options.input ? ($('app-modal-input')?.value ?? '') : options.memberList ? selected : true);
+    cancelBtn.onclick = () => finish(null);
+    $('app-modal-close').onclick = () => finish(null);
+    modal.onclose = () => { if (modal.open) return; finish(null); };
+    if (options.input) {
+      const inp = $('app-modal-input');
+      if (inp) inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); confirmBtn.click(); } });
+    }
+    modal.showModal();
+    if (options.input) $('app-modal-input')?.focus();
+    else if (options.memberList) $('app-modal-search-input')?.focus();
+  });
+}
 
 function updateUnreadTitle() {
   const unread = Object.values(state.inbox).reduce((total, item) => total + Number(item.unreadCount || 0), 0);
@@ -155,14 +210,37 @@ function renderMessages(rawMessages, jumpToLatest = false) {
   const rows = visibleMessages();
   if (!rows.length) { list.innerHTML = '<p class="list-empty messages-empty">No messages yet. Say hello!</p>'; return; }
   const latestSeenMessageId = [...rows].reverse().find((message) => message.senderId === state.user?.uid && Number(message.timestamp || 0) <= state.peerSeenAt)?.id;
+  const groupLatestSeen = {};
+  if (state.activeInboxItem?.isGroup) {
+    Object.entries(state.groupSeenAt || {}).forEach(([uid, time]) => {
+      if (uid === state.user?.uid) return;
+      const msg = [...rows].reverse().find(m => Number(m.timestamp || 0) <= time);
+      if (msg) {
+        if (!groupLatestSeen[msg.id]) groupLatestSeen[msg.id] = [];
+        groupLatestSeen[msg.id].push(uid);
+      }
+    });
+  }
   list.innerHTML = rows.map((message) => {
+    if (message.isSystem) return `<div class="message-row system" style="text-align:center; font-size:12px; color:var(--muted); margin: 8px 0; width: 100%; justify-content: center;">${escapeHtml(getNickname(message.senderId))} ${escapeHtml(message.text)}</div>`;
     const mine = message.senderId === state.user?.uid;
     const reactionSummary = Object.entries(message.reactions || {}).map(([type, people]) => Object.keys(people || {}).length ? `<span class="reaction-chip">${reactions[type] || ''} ${Object.keys(people).length}</span>` : '').join('');
     const quote = message.replyTo ? `<div class="reply-quote">Reply to ${escapeHtml(getNickname(message.replyTo.senderId))}: ${escapeHtml(replyPreview(message.replyTo))}</div>` : '';
     const image = message.image ? `<img class="message-image" src="${escapeHtml(message.image)}" alt="Shared photo">` : '';
-    const seen = mine && message.id === latestSeenMessageId ? '<span class="seen-label">Seen</span>' : '';
+    
+    let seen = '';
+    if (state.activeInboxItem?.isGroup) {
+      const viewers = groupLatestSeen[message.id];
+      if (viewers && viewers.length) {
+        const avatars = viewers.map(uid => `<img class="avatar micro" src="${escapeHtml(avatarUrl(state.users[uid]))}" title="${escapeHtml(getNickname(uid))}" style="width:14px; height:14px; border-radius:50%; margin-right:2px; object-fit:cover;">`).join('');
+        seen = `<span class="seen-label group-seen" style="display:flex; align-items:center; margin-left:4px;" title="Seen by ${escapeHtml(viewers.map(uid => getNickname(uid)).join(', '))}">${avatars}</span>`;
+      }
+    } else {
+      seen = mine && message.id === latestSeenMessageId ? '<span class="seen-label">Seen</span>' : '';
+    }
+    
     const senderNameHtml = (state.activeInboxItem?.isGroup && !mine) ? `<div class="message-sender-name" style="font-size:10px; color:var(--muted); margin-bottom:2px; margin-left:4px;">${escapeHtml(getNickname(message.senderId))}</div>` : '';
-    return `<div class="message-row${mine ? ' me' : ''}"><div>${senderNameHtml}<div class="message-bubble" data-message="${escapeHtml(message.id)}">${quote}${linkifyText(message.text || '')}${image}</div><div class="message-meta"><div class="message-time">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div>${reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}</div></div>`;
+    return `<div class="message-row${mine ? ' me' : ''}"><div>${senderNameHtml}<div class="message-bubble" data-message="${escapeHtml(message.id)}">${quote}${linkifyText(message.text || '')}${image}</div><div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div>${reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}</div></div>`;
   }).join('');
   wireMessageGestures(rows);
   if (jumpToLatest || wasNearLatest) requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
@@ -192,9 +270,15 @@ function wireMessageGestures(rows) {
     const cancel = () => { clearTimeout(pressTimer); pressTimer = null; };
     bubble.addEventListener('pointerdown', (event) => {
       if (event.target.closest('.message-link')) return;
-      if (event.button !== undefined && event.button !== 0) return;
-      pressed = false;
-      pressTimer = setTimeout(() => { pressed = true; navigator.vibrate?.(12); showMessageMenu(message, event.clientX, event.clientY); }, 520);
+      pressed = true; pressTimer = setTimeout(() => { if (pressed) showMessageMenu(message, event.clientX, event.clientY); }, 500);
+    });
+    bubble.addEventListener('click', (event) => {
+      if (event.target.closest('.message-link')) return;
+      const meta = bubble.nextElementSibling;
+      if (meta && meta.classList.contains('message-meta')) {
+        const time = meta.querySelector('.message-time');
+        if (time) time.classList.toggle('hidden');
+      }
     });
     bubble.addEventListener('pointerup', cancel); bubble.addEventListener('pointercancel', cancel); bubble.addEventListener('pointerleave', cancel);
     bubble.addEventListener('contextmenu', (event) => { event.preventDefault(); cancel(); showMessageMenu(message, event.clientX, event.clientY); });
@@ -214,8 +298,21 @@ function markThreadSeen(threadId = state.activeThreadId) {
   set(ref(db, `chatReads/${state.user.uid}/${threadId}`), Date.now()).catch(() => {});
 }
 function watchSeen(threadId) {
-  if (state.stopSeen) state.stopSeen(); state.peerSeenAt = 0;
-  if (state.activeInboxItem?.isGroup) return; // Group read receipts omitted for brevity
+  if (state.stopSeen) {
+    if (typeof state.stopSeen === 'function') state.stopSeen();
+    else if (Array.isArray(state.stopSeen)) state.stopSeen.forEach(fn => fn());
+  }
+  state.stopSeen = null; state.peerSeenAt = 0; state.groupSeenAt = {};
+  if (state.activeInboxItem?.isGroup) {
+    const peerIds = getThreadPeers(state.activeInboxItem);
+    state.stopSeen = peerIds.map(uid => 
+      onValue(ref(db, `chatReads/${uid}/${threadId}`), (snapshot) => {
+        state.groupSeenAt[uid] = Number(snapshot.val() || 0);
+        renderMessages(state.messages);
+      }, (error) => reportRealtimeError('seen receipts', error))
+    );
+    return;
+  }
   state.stopSeen = onValue(ref(db, `chatReads/${state.activePeerId}/${threadId}`), (snapshot) => { state.peerSeenAt = Number(snapshot.val() || 0); renderMessages(state.messages); }, (error) => reportRealtimeError('seen receipts', error));
 }
 
@@ -256,7 +353,7 @@ async function startGroupConversation(peerIds) {
     peerIds.forEach(id => members[id] = true);
     const now = Date.now();
     await set(ref(db, `chatThreads/${threadId}`), { members, isGroup: true, creatorId: state.user.uid, createdAt: now, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid });
-    const summary = { isGroup: true, members, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid, unreadCount: 0 };
+    const summary = { isGroup: true, members, lastMessage: 'Group created', lastTimestamp: now, lastSenderId: state.user.uid, unreadCount: 0, creatorId: state.user.uid };
     await set(ref(db, `chatInboxes/${state.user.uid}/${threadId}`), summary);
     peerIds.forEach(id => runTransaction(ref(db, `chatInboxes/${id}/${threadId}`), (current) => current || summary).catch(()=>{}));
     
@@ -264,7 +361,7 @@ async function startGroupConversation(peerIds) {
     state.groupMode = false;
     state.groupSelection = [];
     $('group-action-bar').classList.add('hidden');
-    $('toggle-group-mode').textContent = 'Group';
+    $('toggle-group-mode').textContent = 'Create Group';
     openThread(threadId, summary);
   } catch (error) { showToast(`Could not start group chat: ${error.message}`); }
 }
@@ -293,6 +390,7 @@ function resetComposer() { $('message-input').value = ''; $('message-input').sty
 async function updateConversationSummaries(preview, timestamp) {
   const own = { ...(state.inbox[state.activeThreadId] || {}), lastMessage: preview, lastTimestamp: timestamp, lastSenderId: state.user.uid, unreadCount: 0 };
   if (!state.activeInboxItem?.isGroup) own.peerId = state.activePeerId;
+  delete own.name; delete own.nicknames; delete own.creatorId;
   await update(ref(db), {
     [`chatThreads/${state.activeThreadId}/lastMessage`]: preview, [`chatThreads/${state.activeThreadId}/lastTimestamp`]: timestamp, [`chatThreads/${state.activeThreadId}/lastSenderId`]: state.user.uid,
     [`chatInboxes/${state.user.uid}/${state.activeThreadId}`]: own
@@ -338,7 +436,9 @@ async function toggleReaction(messageId, reaction) {
 function setReply(message) { if (!message) return; state.replyTo = message; $('reply-banner-text').textContent = `Replying to ${getNickname(message.senderId)}: ${replyPreview(message)}`; $('reply-banner').classList.remove('hidden'); $('message-input').focus(); }
 function clearReply() { state.replyTo = null; $('reply-banner').classList.add('hidden'); }
 async function editMessage(message) {
-  if (!message || message.senderId !== state.user?.uid) return; const text = window.prompt('Edit your message:', message.text || ''); if (text === null) return; const nextText = text.trim(); if (!nextText && !message.image) return showToast('A message cannot be empty.');
+  if (!message || message.senderId !== state.user?.uid) return;
+  const text = await showAppModal({ title: 'Edit Message', input: true, inputValue: message.text || '', placeholder: 'Edit your message', confirmText: 'Save' });
+  if (text === null) return; const nextText = text.trim(); if (!nextText && !message.image) return showToast('A message cannot be empty.');
   try { await update(ref(db), { [`chatMessages/${state.activeThreadId}/${message.id}/text`]: nextText, [`chatMessages/${state.activeThreadId}/${message.id}/editedAt`]: Date.now() }); } catch (error) { showToast(`Could not edit: ${error.message.replace('Firebase: ', '')}`); }
 }
 
@@ -350,7 +450,12 @@ function setTyping(active) {
 function noteTyping() { setTyping(true); clearTimeout(state.typingTimer); state.typingTimer = setTimeout(() => setTyping(false), 1600); }
 function closeActiveChat() {
   setTyping(false); clearTimeout(state.typingTimer); if (state.stopMessages) state.stopMessages(); if (state.stopTyping) state.stopTyping(); if (state.stopSeen) state.stopSeen();
-  state.stopMessages = null; state.stopTyping = null; state.stopSeen = null; state.activeThreadId = null; state.activePeerId = null; state.activeInboxItem = null; state.messages = {}; state.messagesLoaded = false; state.typing = {}; state.peerSeenAt = 0; clearReply(); closeMessageMenu();
+  state.stopMessages = null; state.stopTyping = null;
+  if (state.stopSeen) {
+    if (typeof state.stopSeen === 'function') state.stopSeen();
+    else if (Array.isArray(state.stopSeen)) state.stopSeen.forEach(fn => fn());
+  }
+  state.stopSeen = null; state.activeThreadId = null; state.activePeerId = null; state.activeInboxItem = null; state.messages = {}; state.messagesLoaded = false; state.typing = {}; state.peerSeenAt = 0; state.groupSeenAt = {}; clearReply(); closeMessageMenu();
   $('active-chat').classList.add('hidden'); $('empty-state').classList.remove('hidden'); renderConversations();
 }
 async function clearChatForMe() {
@@ -358,8 +463,11 @@ async function clearChatForMe() {
   try { await set(ref(db, `chatClears/${state.user.uid}/${state.activeThreadId}`), Date.now()); $('conversation-dialog').close(); renderMessages(state.messages); showToast('Messages cleared for you.'); } catch (error) { showToast(`Could not clear messages: ${error.message.replace('Firebase: ', '')}`); }
 }
 async function removeConversation() {
-  if (!state.user || !state.activeThreadId || !window.confirm('Remove this conversation from your inbox? Your messages will remain for the other member.')) return;
-  try { const threadId = state.activeThreadId; await set(ref(db, `chatClears/${state.user.uid}/${threadId}`), Date.now()); await remove(ref(db, `chatInboxes/${state.user.uid}/${threadId}`)); $('conversation-dialog').close(); closeActiveChat(); showToast('Conversation removed. Its old messages will stay cleared if you chat again.'); } catch (error) { showToast(`Could not remove conversation: ${error.message.replace('Firebase: ', '')}`); }
+  if (!state.user || !state.activeThreadId) return;
+  $('conversation-dialog').close();
+  const confirmed = await showAppModal({ title: 'Remove Conversation', message: 'Remove this conversation from your inbox? Your messages will remain for the other member.', confirmText: 'Remove', danger: true });
+  if (!confirmed) return;
+  try { const threadId = state.activeThreadId; await set(ref(db, `chatClears/${state.user.uid}/${threadId}`), Date.now()); await remove(ref(db, `chatInboxes/${state.user.uid}/${threadId}`)); closeActiveChat(); showToast('Conversation removed. Its old messages will stay cleared if you chat again.'); } catch (error) { showToast(`Could not remove conversation: ${error.message.replace('Firebase: ', '')}`); }
 }
 
 function showAuth() { $('auth-dialog').showModal(); }
@@ -400,7 +508,16 @@ function syncThreadSummaryWatchers() {
   });
 }
 function handleInbox(snapshot) {
-  const previous = state.inbox; const next = snapshot.val() || {}; state.inbox = next;
+  const previous = state.inbox; const next = snapshot.val() || {};
+  Object.keys(next).forEach(id => {
+    if (previous[id]) {
+      if (previous[id].name !== undefined) next[id].name = previous[id].name;
+      if (previous[id].creatorId !== undefined) next[id].creatorId = previous[id].creatorId;
+      if (previous[id].members !== undefined) next[id].members = previous[id].members;
+      if (previous[id].nicknames !== undefined) next[id].nicknames = previous[id].nicknames;
+    }
+  });
+  state.inbox = next;
   if (state.inboxReady && state.user) Object.entries(next).forEach(([threadId, item]) => {
     const before = previous[threadId];
     if (item.lastSenderId !== state.user.uid && Number(item.lastTimestamp || 0) > Number(before?.lastTimestamp || 0)) showToast(`New message from ${state.users[item.peerId]?.name || 'a member'}`);
@@ -433,8 +550,9 @@ $('mobile-back-button').addEventListener('click', closeActiveChat);
 $('conversation-options-button').addEventListener('click', () => {
   const isGroup = state.activeInboxItem?.isGroup;
   const isCreator = isGroup && state.activeInboxItem?.creatorId === state.user?.uid;
-  $('set-nickname-button').classList.toggle('hidden', isGroup);
-  $('rename-group-button').classList.toggle('hidden', !isGroup);
+  $('set-nickname-button').classList.toggle('hidden', !!isGroup);
+  $('rename-group-button').classList.toggle('hidden', !isCreator);
+  $('add-member-button').classList.toggle('hidden', !isCreator);
   $('kick-member-button').classList.toggle('hidden', !isCreator);
   $('leave-group-button').classList.toggle('hidden', !isGroup);
   $('conversation-dialog').showModal();
@@ -443,6 +561,7 @@ $('close-conversation-dialog').addEventListener('click', () => $('conversation-d
 $('clear-chat-button').addEventListener('click', clearChatForMe);
 $('remove-conversation-button').addEventListener('click', removeConversation);
 $('rename-group-button')?.addEventListener('click', renameGroup);
+$('add-member-button')?.addEventListener('click', addMember);
 $('kick-member-button')?.addEventListener('click', kickMember);
 $('leave-group-button')?.addEventListener('click', leaveGroup);
 $('close-auth-button').addEventListener('click', () => $('auth-dialog').close());
@@ -451,66 +570,95 @@ $('toggle-group-mode')?.addEventListener('click', () => {
   state.groupMode = !state.groupMode;
   state.groupSelection = [];
   $('group-action-bar').classList.toggle('hidden', !state.groupMode);
-  $('toggle-group-mode').textContent = state.groupMode ? 'Cancel Group' : 'Group';
+  $('toggle-group-mode').textContent = state.groupMode ? 'Cancel' : 'Create Group';
   renderPeople();
 });
 $('start-group-btn')?.addEventListener('click', () => {
   if (state.groupSelection.length > 0) startGroupConversation(state.groupSelection);
 });
 $('set-nickname-button')?.addEventListener('click', async () => {
-  if (!state.user || !state.activeThreadId) return;
+  if (!state.user || !state.activeThreadId || state.activeInboxItem?.isGroup) return;
   const peerIds = getThreadPeers(state.activeInboxItem);
-  const targetUid = peerIds[0];
-  if (!targetUid) return;
-  const currentNick = getNickname(targetUid);
-  const realName = state.users[targetUid]?.name || 'Member';
-  const nick = window.prompt(`Enter nickname for ${realName}:`, currentNick === realName ? '' : currentNick);
-  if (nick === null) return;
+  if (!peerIds.length) return;
+  const targetUid = peerIds[0]; const targetUser = state.users[targetUid];
+  if (!targetUser) return;
+  const newNickname = await showAppModal({ title: 'Set Nickname', message: `Set a nickname for ${targetUser.name}. Leave blank to reset.`, input: true, inputValue: state.activeInboxItem.nicknames?.[targetUid] || '' });
+  if (newNickname === null) return;
   try {
-    await update(ref(db, `chatThreads/${state.activeThreadId}/nicknames`), { [targetUid]: nick.trim() || null });
-    $('conversation-dialog').close();
+    await update(ref(db, `chatThreads/${state.activeThreadId}/nicknames`), { [targetUid]: newNickname.trim() || null });
     showToast('Nickname updated.');
   } catch (err) { showToast('Could not update nickname.'); }
 });
 
 async function renameGroup() {
   if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
+  if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the group creator can rename the group.');
   const current = state.activeInboxItem.name || getThreadName(state.activeInboxItem, getThreadPeers(state.activeInboxItem));
-  const newName = window.prompt('Enter a new group name:', current);
+  $('conversation-dialog').close();
+  const newName = await showAppModal({ title: 'Rename Group', message: 'Enter a new name for this group chat.', input: true, inputValue: current, placeholder: 'Group name', confirmText: 'Rename' });
   if (newName === null || !newName.trim()) return;
   try {
     await update(ref(db, `chatThreads/${state.activeThreadId}`), { name: newName.trim() });
-    $('conversation-dialog').close();
     showToast('Group renamed.');
   } catch (err) { showToast(`Could not rename group: ${err.message}`); }
 }
 
 async function kickMember() {
   if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
-  if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the group creator can kick members.');
-  const peerIds = getThreadPeers(state.activeInboxItem);
-  if (!peerIds.length) return showToast('No members to kick.');
-  const names = peerIds.map(id => `${state.users[id]?.name || 'Member'} — ${id}`).join('\n');
-  const input = window.prompt(`Enter the name or ID of the member to kick:\n\n${names}`);
-  if (!input) return;
-  const targetUid = peerIds.find(id => id === input.trim() || (state.users[id]?.name || '').toLowerCase() === input.trim().toLowerCase());
-  if (!targetUid) return showToast('Member not found. Please enter their exact name or ID.');
-  if (!window.confirm(`Kick ${state.users[targetUid]?.name || 'this member'} from the group?`)) return;
+  if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the group creator can view/kick members here.');
+  const allIds = Object.keys(state.activeInboxItem.members || {});
+  if (allIds.length <= 1) return showToast('No other members to kick.');
+  const memberList = allIds.map(id => ({ uid: id, name: state.users[id]?.name || 'Member', avatar: avatarUrl(state.users[id]), isCreator: id === state.activeInboxItem.creatorId }));
+  $('conversation-dialog').close();
+  const selected = await showAppModal({ title: 'Show / Kick Member', message: 'Select a member to remove from this group.', memberList, disabledUid: state.user.uid, multiSelect: false, confirmText: 'Kick', danger: true });
+  if (!selected || !selected.length) return;
+  const targetUid = selected[0]; const targetName = state.users[targetUid]?.name || 'this member';
+  const confirmed = await showAppModal({ title: 'Confirm Kick', message: `Are you sure you want to kick ${targetName} from the group?`, confirmText: 'Kick', danger: true });
+  if (!confirmed) return;
   try {
-    await update(ref(db, `chatThreads/${state.activeThreadId}/members`), { [targetUid]: null });
-    await remove(ref(db, `chatInboxes/${targetUid}/${state.activeThreadId}`));
-    $('conversation-dialog').close();
-    showToast(`${state.users[targetUid]?.name || 'Member'} was kicked.`);
-  } catch (err) { showToast(`Could not kick member: ${err.message}`); }
+    await remove(ref(db, `chatThreads/${state.activeThreadId}/members/${targetUid}`));
+  } catch (err) { return showToast(`Failed to remove member: ${err.message}`); }
+  
+  remove(ref(db, `chatInboxes/${targetUid}/${state.activeThreadId}`)).catch(e => console.warn('Ignored inbox remove error:', e));
+  
+  try {
+    await push(ref(db, `chatMessages/${state.activeThreadId}`), { senderId: state.user.uid, text: `kicked ${targetName}.`, timestamp: Date.now(), isSystem: true });
+  } catch (err) { console.warn('Failed to send kick system message:', err); }
+  
+  showToast(`${targetName} was kicked.`);
+}
+
+async function addMember() {
+  if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
+  if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the group creator can add members.');
+  const currentMembers = Object.keys(state.activeInboxItem.members || {});
+  const nonMembers = Object.values(state.users).filter(u => u.uid && !currentMembers.includes(u.uid) && !u.isBanned);
+  if (!nonMembers.length) return showToast('No available members to add.');
+  const memberList = nonMembers.map(u => ({ uid: u.uid, name: u.name || 'Member', avatar: avatarUrl(u) }));
+  $('conversation-dialog').close();
+  const selected = await showAppModal({ title: 'Add Members', message: 'Select members to add to this group.', memberList, multiSelect: true, confirmText: 'Add' });
+  if (!selected || !selected.length) return;
+  try {
+    await Promise.all(selected.map(uid => set(ref(db, `chatThreads/${state.activeThreadId}/members/${uid}`), true)));
+    const updatedMembers = { ...(state.activeInboxItem.members || {}) };
+    selected.forEach(uid => updatedMembers[uid] = true);
+    const summary = { isGroup: true, members: updatedMembers, lastMessage: state.activeInboxItem.lastMessage || 'Added to group', lastTimestamp: state.activeInboxItem.lastTimestamp || Date.now(), lastSenderId: state.activeInboxItem.lastSenderId || state.user.uid, unreadCount: 1, name: state.activeInboxItem.name || '', creatorId: state.activeInboxItem.creatorId || state.user.uid };
+    for (const uid of selected) { await runTransaction(ref(db, `chatInboxes/${uid}/${state.activeThreadId}`), (current) => current || summary).catch(() => {}); }
+    const addedNames = selected.map(uid => state.users[uid]?.name || 'a member').join(', ');
+    await push(ref(db, `chatMessages/${state.activeThreadId}`), { senderId: state.user.uid, text: `added ${addedNames}.`, timestamp: Date.now(), isSystem: true });
+    showToast(`${selected.length} member${selected.length > 1 ? 's' : ''} added.`);
+  } catch (err) { showToast(`Could not add members: ${err.message}`); }
 }
 
 async function leaveGroup() {
   if (!state.user || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
-  if (!window.confirm('Leave this group chat?')) return;
+  $('conversation-dialog').close();
+  const confirmed = await showAppModal({ title: 'Leave Group', message: 'Are you sure you want to leave this group chat?', confirmText: 'Leave', danger: true });
+  if (!confirmed) return;
   try {
-    await update(ref(db, `chatThreads/${state.activeThreadId}/members`), { [state.user.uid]: null });
+    await push(ref(db, `chatMessages/${state.activeThreadId}`), { senderId: state.user.uid, text: `left the group.`, timestamp: Date.now(), isSystem: true });
+    await update(ref(db), { [`chatThreads/${state.activeThreadId}/members/${state.user.uid}`]: null });
     await remove(ref(db, `chatInboxes/${state.user.uid}/${state.activeThreadId}`));
-    $('conversation-dialog').close();
     closeActiveChat();
     showToast('You have left the group.');
   } catch (err) { showToast(`Could not leave group: ${err.message}`); }
