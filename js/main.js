@@ -326,7 +326,14 @@ onValue(ref(db, 'users'), (snap) => {
                     const msg = n.type === 'mention' ? `${sourceUser?.name || 'Someone'} mentioned you!` : 
                                 n.type === 'comment' ? `${sourceUser?.name || 'Someone'} commented on your post!` :
                                 `You have a new notification`;
-                    new Notification("Hangout", { body: msg, icon: sourceUser?.pic || './icon.jpg' });
+                    const iconUrl = sourceUser?.pic || './icon-192.png';
+                    if (navigator.serviceWorker) {
+                        navigator.serviceWorker.ready.then(reg => {
+                            reg.showNotification("Hangout", { body: msg, icon: iconUrl });
+                        }).catch(() => new Notification("Hangout", { body: msg, icon: iconUrl }));
+                    } else {
+                        new Notification("Hangout", { body: msg, icon: iconUrl });
+                    }
                 }
                 if (n.timestamp > maxTime) maxTime = n.timestamp;
             }
