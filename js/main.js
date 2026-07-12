@@ -9,7 +9,7 @@ import "./renderers.js";
 const presenceSessionId = `posts_${crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
 const presenceSessionRef = (uid) => ref(db, `presence/${uid}/${presenceSessionId}`);
 function startOwnPresence(user = auth.currentUser) {
-    if (!user) return;
+    if (!user || document.visibilityState !== 'visible') return;
     const sessionRef = presenceSessionRef(user.uid);
     onDisconnect(sessionRef).remove();
     set(sessionRef, true);
@@ -17,6 +17,16 @@ function startOwnPresence(user = auth.currentUser) {
 function stopOwnPresence(user = auth.currentUser) {
     if (user) remove(presenceSessionRef(user.uid));
 }
+
+document.addEventListener('visibilitychange', () => {
+    if (auth.currentUser) {
+        if (document.visibilityState === 'visible') {
+            startOwnPresence(auth.currentUser);
+        } else {
+            stopOwnPresence(auth.currentUser);
+        }
+    }
+});
 
 // ==========================================
 // SEARCH & FILTERS
