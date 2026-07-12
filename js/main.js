@@ -273,6 +273,18 @@ document.addEventListener("input", (e) => {
 // ==========================================
 // DB LISTENERS
 // ==========================================
+
+// ==========================================
+// AUTHENTICATION & INITIALIZATION
+// ==========================================
+window.lastNotifTime = Date.now();
+
+window.requestNotificationPermission = async () => {
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+        try { await Notification.requestPermission(); } catch(e) {}
+    }
+};
+
 onValue(ref(db, '.info/connected'), (snap) => {
     if (snap.val() === true && auth.currentUser) {
         startOwnPresence(auth.currentUser);
@@ -303,6 +315,23 @@ onValue(ref(db, 'users'), (snap) => {
         });
         const catSelect = document.getElementById('post-category');
         if (role.level === 1 && (catSelect.value === 'Announcements' || catSelect.value === 'Rules')) catSelect.value = 'General';
+        
+        // Local Push Notifications Check
+        const myNotifs = window.globalUsersCache[window.currentUser.uid].notifications || {};
+        let maxTime = window.lastNotifTime || Date.now();
+        Object.values(myNotifs).forEach(n => {
+            if (!n.read && n.timestamp > (window.lastNotifTime || Date.now())) {
+                if ("Notification" in window && Notification.permission === "granted") {
+                    const sourceUser = window.globalUsersCache[n.sourceUid];
+                    const msg = n.type === 'mention' ? `${sourceUser?.name || 'Someone'} mentioned you!` : 
+                                n.type === 'comment' ? `${sourceUser?.name || 'Someone'} commented on your post!` :
+                                `You have a new notification`;
+                    new Notification("Hangout", { body: msg, icon: sourceUser?.pic || './icon.jpg' });
+                }
+                if (n.timestamp > maxTime) maxTime = n.timestamp;
+            }
+        });
+        window.lastNotifTime = maxTime;
     }
     
     window.updateNotifBadge();
@@ -857,15 +886,16 @@ window.addEventListener('beforeinstallprompt', (e) => {
 });
 
 document.getElementById('install-pwa-btn')?.addEventListener('click', async () => {
-    window.requestNotificationPermission(); // Ask for permission here too
+    try { window.requestNotificationPermission(); } catch(e) {}
+    
     if (deferredPrompt) {
         deferredPrompt.prompt();
         const { outcome } = await deferredPrompt.userChoice;
         if (outcome === 'accepted') console.log('User accepted the install prompt');
         deferredPrompt = null;
     } else {
-        if (window.showAlert) window.showAlert(`To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.`);
-        else alert(`To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.`);
+        const msg = "To install Hangout, tap your browser's menu (the 3 dots) and select 'Install app' or 'Add to Home screen'.";
+        if (window.showAlert) window.showAlert(msg);
+        else alert(msg);
     }
 });
-
