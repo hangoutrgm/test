@@ -9,7 +9,8 @@ import "./renderers.js";
 const presenceSessionId = `posts_${crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
 const presenceSessionRef = (uid) => ref(db, `presence/${uid}/${presenceSessionId}`);
 function startOwnPresence(user = auth.currentUser) {
-    if (!user || document.visibilityState !== 'visible') return;
+    if (!user) return;
+    if (document.visibilityState !== 'visible') return;
     const sessionRef = presenceSessionRef(user.uid);
     onDisconnect(sessionRef).remove();
     set(sessionRef, true);
@@ -18,16 +19,6 @@ function stopOwnPresence(user = auth.currentUser) {
     if (user) return remove(presenceSessionRef(user.uid));
     return Promise.resolve();
 }
-
-document.addEventListener('visibilitychange', () => {
-    if (auth.currentUser) {
-        if (document.visibilityState === 'visible') {
-            startOwnPresence(auth.currentUser);
-        } else {
-            stopOwnPresence(auth.currentUser);
-        }
-    }
-});
 
 // ==========================================
 // SEARCH & FILTERS
@@ -834,43 +825,21 @@ document.getElementById('auth-action-btn').addEventListener('click', async () =>
     const pass = document.getElementById('auth-password').value;
     try {
         if (window.isSignUpMode) {
-            await stopOwnPresence(auth.currentUser);
-            try {
-                const cred = await createUserWithEmailAndPassword(auth, email, pass);
-                const newName = `User_${Math.floor(Math.random()*999)}`;
-                const newPic = window.generateAvatar(cred.user.uid);
-                await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
-                
-                update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic });
-                document.getElementById('nav-avatar').src = newPic;
-            } catch (error) {
-                startOwnPresence(auth.currentUser);
-                throw error;
-            }
-        } else {
-            await stopOwnPresence(auth.currentUser);
-            try {
-                await signInWithEmailAndPassword(auth, email, pass);
-            } catch (error) {
-                startOwnPresence(auth.currentUser);
-                throw error;
-            }
-        }
+            const cred = await createUserWithEmailAndPassword(auth, email, pass);
+            const newName = `User_${Math.floor(Math.random()*999)}`;
+            const newPic = window.generateAvatar(cred.user.uid);
+            await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
+            
+            update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic });
+            document.getElementById('nav-avatar').src = newPic;
+        } else await signInWithEmailAndPassword(auth, email, pass);
         document.getElementById('auth-modal').classList.add('hidden');
     } catch (error) { showError(error.message.replace('Firebase:', '')); }
 });
 
 document.getElementById('guest-login-btn').addEventListener('click', async () => {
     const guestEmail = `guest_${window.deviceId}@hangout.local`, guestPass = window.deviceId + "_secret";
-    if (auth.currentUser && auth.currentUser.email === guestEmail) {
-        document.getElementById('auth-modal').classList.add('hidden');
-        return;
-    }
-    try { 
-        await stopOwnPresence(auth.currentUser);
-        await signInWithEmailAndPassword(auth, guestEmail, guestPass); 
-        document.getElementById('auth-modal').classList.add('hidden'); 
-    } 
+    try { await signInWithEmailAndPassword(auth, guestEmail, guestPass); document.getElementById('auth-modal').classList.add('hidden'); } 
     catch {
         try {
             const cred = await createUserWithEmailAndPassword(auth, guestEmail, guestPass);
@@ -881,15 +850,12 @@ document.getElementById('guest-login-btn').addEventListener('click', async () =>
             update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic, isGuest: true });
             document.getElementById('nav-avatar').src = newPic;
             document.getElementById('auth-modal').classList.add('hidden');
-        } catch(e) { 
-            startOwnPresence(auth.currentUser);
-            showError("Failed to create guest account."); 
-        }
+        } catch(e) { showError("Failed to create guest account."); }
     }
 });
 
-document.getElementById('logout-btn').addEventListener('click', async () => { 
-    await stopOwnPresence(window.currentUser); 
+document.getElementById('logout-btn').addEventListener('click', () => { 
+    stopOwnPresence(window.currentUser); 
     signOut(auth); 
 });
 
@@ -918,6 +884,21 @@ onAuthStateChanged(auth, (user) => {
     }
     if(!window.activeProfileUid) window.renderFeed(false);
 });
+
+// Presence visibility handling for PWA background/foreground
+function setupPresenceVisibilityHandlers() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      stopOwnPresence(window.currentUser);
+    } else {
+      startOwnPresence(window.currentUser);
+    }
+  });
+  window.addEventListener('pagehide', () => stopOwnPresence(window.currentUser));
+  window.addEventListener('pageshow', () => startOwnPresence(window.currentUser));
+  window.addEventListener('beforeunload', () => stopOwnPresence(window.currentUser));
+}
+setupPresenceVisibilityHandlers();
 
 // ==========================================
 // PWA INSTALLATION LOGIC
