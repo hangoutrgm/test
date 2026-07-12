@@ -847,35 +847,25 @@ onAuthStateChanged(auth, (user) => {
     if(!window.activeProfileUid) window.renderFeed(false);
 });
 
-
 // ==========================================
 // PWA INSTALLATION LOGIC
 // ==========================================
 let deferredPrompt;
 window.addEventListener('beforeinstallprompt', (e) => {
-    // Prevent the mini-infobar from appearing on mobile
     e.preventDefault();
-    // Stash the event so it can be triggered later.
     deferredPrompt = e;
 });
 
 document.getElementById('install-pwa-btn')?.addEventListener('click', async () => {
+    window.requestNotificationPermission(); // Ask for permission here too
     if (deferredPrompt) {
         deferredPrompt.prompt();
         const { outcome } = await deferredPrompt.userChoice;
-        if (outcome === 'accepted') {
-            console.log('User accepted the install prompt');
-        } else {
-            console.log('User dismissed the install prompt');
-        }
+        if (outcome === 'accepted') console.log('User accepted the install prompt');
         deferredPrompt = null;
     } else {
-        // Fallback if the event hasn't fired or app is already installed
-        if (window.showAlert) {
-            window.showAlert("To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.");
-        } else {
-            alert("To install Hangout, tap your browser's menu (⋮) and select 'Install app' or 'Add to Home screen'.");
-        }
+        if (window.showAlert) window.showAlert(To install Hangout, tap your browser's menu (?) and select 'Install app' or 'Add to Home screen'.);
+        else alert(To install Hangout, tap your browser's menu (?) and select 'Install app' or 'Add to Home screen'.);
     }
 });
 
