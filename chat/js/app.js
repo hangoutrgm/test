@@ -381,8 +381,8 @@ function compressImage(file) {
 }
 
 async function useUploadQuota() {
-  const day = new Date().toISOString().slice(0, 10); const result = await runTransaction(ref(db, `chatUploadQuota/${state.user.uid}/${day}`), (count) => (Number(count || 0) >= 5 ? undefined : Number(count || 0) + 1));
-  if (!result.committed) throw new Error('Daily photo limit reached (5 uploads). Try again tomorrow.');
+  const day = new Date().toISOString().slice(0, 10); const result = await runTransaction(ref(db, `chatUploadQuota/${state.user.uid}/${day}`), (count) => (Number(count || 0) >= 3 ? undefined : Number(count || 0) + 1));
+  if (!result.committed) throw new Error('Daily photo limit reached (3 uploads). Try again tomorrow.');
 }
 
 function clearAttachment() { $('image-input').value = ''; state.pendingImageFile = null; }
@@ -555,7 +555,7 @@ $('message-input').addEventListener('keydown', (event) => { if (event.key === 'E
 } });
 $('send-button').addEventListener('mousedown', e => e.preventDefault());
 $('send-button').addEventListener('touchstart', e => { if (e.cancelable) e.preventDefault(); if (!$('send-button').disabled) $('message-form').requestSubmit(); }, { passive: false });
-$('image-input').addEventListener('change', (event) => { const file = event.target.files[0]; state.pendingImageFile = file || null; if (file) showToast(`Photo ready: ${file.name}. Limit: 5 uploads daily.`); });
+$('image-input').addEventListener('change', (event) => { const file = event.target.files[0]; state.pendingImageFile = file || null; if (file) showToast(`Photo ready: ${file.name}. Limit: 3 uploads daily.`); });
 $('group-photo-input')?.addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
