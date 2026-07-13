@@ -354,10 +354,10 @@ window.loadMorePosts = async () => {
     if (window.isLoadingHistory || !window.hasMorePosts) return;
     
     // Find the oldest post ID we currently have
-    const allKnown = [...window.historicalPosts, ...window.livePosts].sort((a, b) => b.timestamp - a.timestamp);
+    const allKnown = [...window.historicalPosts, ...window.livePosts].sort((a, b) => a.id < b.id ? -1 : (a.id > b.id ? 1 : 0));
     if (allKnown.length === 0) return;
     
-    const oldestId = allKnown[allKnown.length - 1].id;
+    const oldestId = allKnown[0].id;
     window.isLoadingHistory = true;
     
     // Show a small loader at the bottom
