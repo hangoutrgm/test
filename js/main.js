@@ -1,7 +1,7 @@
 // main.js
 import { app, auth, db } from "./firebase-config.js";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
-import { ref, push, onValue, set, update, remove, serverTimestamp, increment, onDisconnect } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { ref, push, onValue, set, update, remove, serverTimestamp, increment, onDisconnect, query, limitToLast } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 import "./globals.js";
 import "./helpers.js";
 import "./renderers.js";
@@ -345,7 +345,7 @@ onValue(ref(db, 'users'), (snap) => {
     window.handleDeepLinks();
 });
 
-onValue(ref(db, 'community_posts'), (snapshot) => {
+onValue(query(ref(db, 'community_posts'), limitToLast(60)), (snapshot) => {
 
     const newPosts = [];
 

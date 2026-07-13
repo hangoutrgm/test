@@ -264,16 +264,27 @@ function showMessageMenu(message, x, y) {
   }));
 }
 
+function openImageViewer(src) {
+  const viewer = $('image-viewer');
+  $('image-viewer-img').src = src;
+  $('image-viewer-save').href = src;
+  viewer.classList.remove('hidden');
+}
+function closeImageViewer() {
+  $('image-viewer').classList.add('hidden');
+  $('image-viewer-img').src = '';
+}
+
 function wireMessageGestures(rows) {
   $('message-list').querySelectorAll('.message-bubble').forEach((bubble) => {
     const message = rows.find((row) => row.id === bubble.dataset.message); let pressTimer; let pressed = false;
     const cancel = () => { clearTimeout(pressTimer); pressTimer = null; };
     bubble.addEventListener('pointerdown', (event) => {
-      if (event.target.closest('.message-link')) return;
+      if (event.target.closest('.message-link') || event.target.classList.contains('message-image')) return;
       pressed = true; pressTimer = setTimeout(() => { if (pressed) showMessageMenu(message, event.clientX, event.clientY); }, 500);
     });
     bubble.addEventListener('click', (event) => {
-      if (event.target.closest('.message-link')) return;
+      if (event.target.closest('.message-link') || event.target.classList.contains('message-image')) return;
       const meta = bubble.nextElementSibling;
       if (meta && meta.classList.contains('message-meta')) {
         const time = meta.querySelector('.message-time');
@@ -283,6 +294,10 @@ function wireMessageGestures(rows) {
     bubble.addEventListener('pointerup', cancel); bubble.addEventListener('pointercancel', cancel); bubble.addEventListener('pointerleave', cancel);
     bubble.addEventListener('contextmenu', (event) => { event.preventDefault(); cancel(); showMessageMenu(message, event.clientX, event.clientY); });
     bubble.addEventListener('click', (event) => { if (pressed) event.preventDefault(); });
+  });
+  // Wire image tap-to-view
+  $('message-list').querySelectorAll('.message-image').forEach((img) => {
+    img.addEventListener('click', (e) => { e.stopPropagation(); openImageViewer(img.src); });
   });
 }
 
@@ -329,7 +344,7 @@ function openThread(threadId, inboxItem) {
   if (state.stopMessages) state.stopMessages();
   state.messages = {}; state.messagesLoaded = false; $('message-list').innerHTML = '<p class="list-empty messages-empty">Loading recent messages…</p>';
   state.stopMessages = onValue(query(ref(db, `chatMessages/${threadId}`), limitToLast(60)), (snapshot) => { const firstLoad = !state.messagesLoaded; state.messagesLoaded = true; renderMessages(snapshot.val(), firstLoad); markThreadSeen(threadId); });
-  watchTyping(threadId); watchSeen(threadId); $('message-input').focus();
+  watchTyping(threadId); watchSeen(threadId); syncThreadSummaryWatchers(); $('message-input').focus();
 }
 
 async function startConversation(peerId) {
@@ -372,9 +387,9 @@ function compressImage(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader(); reader.onerror = () => reject(new Error('Could not read that image.')); reader.onload = () => {
       const image = new Image(); image.onerror = () => reject(new Error('Could not process that image.')); image.onload = () => {
-        const maxSide = 720; const scale = Math.min(1, maxSide / Math.max(image.width, image.height)); const canvas = document.createElement('canvas'); canvas.width = Math.round(image.width * scale); canvas.height = Math.round(image.height * scale);
-        canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height); const output = canvas.toDataURL('image/jpeg', 0.55);
-        if (output.length > 850000) reject(new Error('That image is still too large after compression. Try a smaller one.')); else resolve(output);
+        const maxSide = 1280; const scale = Math.min(1, maxSide / Math.max(image.width, image.height)); const canvas = document.createElement('canvas'); canvas.width = Math.round(image.width * scale); canvas.height = Math.round(image.height * scale);
+        canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height); const output = canvas.toDataURL('image/jpeg', 0.78);
+        if (output.length > 2000000) reject(new Error('That image is still too large after compression. Try a smaller one.')); else resolve(output);
       }; image.src = reader.result;
     }; reader.readAsDataURL(file);
   });
@@ -461,6 +476,7 @@ function closeActiveChat() {
     else if (Array.isArray(state.stopSeen)) state.stopSeen.forEach(fn => fn());
   }
   state.stopSeen = null; state.activeThreadId = null; state.activePeerId = null; state.activeInboxItem = null; state.messages = {}; state.messagesLoaded = false; state.typing = {}; state.peerSeenAt = 0; state.groupSeenAt = {}; clearReply(); closeMessageMenu();
+  syncThreadSummaryWatchers();
   $('active-chat').classList.add('hidden'); $('empty-state').classList.remove('hidden'); renderConversations();
 }
 async function clearChatForMe() {
@@ -495,7 +511,7 @@ function stopThreadSummaryWatchers() {
   state.stopThreadSummaries = {};
 }
 function syncThreadSummaryWatchers() {
-  const threadIds = new Set(Object.keys(state.inbox));
+  const threadIds = new Set(state.activeThreadId ? [state.activeThreadId] : []);
   Object.entries(state.stopThreadSummaries).forEach(([threadId, stop]) => {
     if (!threadIds.has(threadId)) { stop(); delete state.stopThreadSummaries[threadId]; }
   });
@@ -718,3 +734,7 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', () => { document.body.style.height = `${window.visualViewport.height}px`; });
   document.body.style.height = `${window.visualViewport.height}px`;
 }
+// Image viewer close handlers (v4.4)
+$('image-viewer-close').addEventListener('click', closeImageViewer);
+$('image-viewer-backdrop').addEventListener('click', closeImageViewer);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeImageViewer(); });
