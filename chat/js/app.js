@@ -1,4 +1,4 @@
-import { auth, db } from '../../js/firebase-config.js';
+import { auth, db, cloudinaryConfig } from '../../js/firebase-config.js';
 import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, updateProfile } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
 import { get, limitToLast, onDisconnect, onValue, push, query, ref, remove, runTransaction, set, update } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
 
@@ -126,6 +126,12 @@ function renderConversations() {
     return !term || `${name} ${item.lastMessage || ''}`.toLowerCase().includes(term);
   }).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
   if (!state.user) { list.innerHTML = ''; return; }
+  if (!Object.keys(state.inbox).length && !state.inboxReady) {
+    list.innerHTML = `<div class="conv-skeleton-list">${Array.from({length:6}, () =>
+      `<div class="conv-skeleton-row"><div class="conv-skeleton-avatar skeleton"></div><div class="conv-skeleton-body"><div class="conv-skeleton-name skeleton"></div><div class="conv-skeleton-preview skeleton"></div></div></div>`
+    ).join('')}</div>`;
+    return;
+  }
   if (!items.length) { list.innerHTML = '<p class="list-empty">No conversations yet. Tap the compose button to say hello.</p>'; return; }
   list.innerHTML = items.map((item) => {
     const peerIds = getThreadPeers(item);
@@ -225,8 +231,15 @@ function renderMessages(rawMessages, jumpToLatest = false) {
     if (message.isSystem) return `<div class="message-row system" style="text-align:center; font-size:12px; color:var(--muted); margin: 8px 0; width: 100%; max-width: 100%; justify-content: center;">${escapeHtml(getNickname(message.senderId))} ${escapeHtml(message.text)}</div>`;
     const mine = message.senderId === state.user?.uid;
     const reactionSummary = Object.entries(message.reactions || {}).map(([type, people]) => Object.keys(people || {}).length ? `<span class="reaction-chip">${reactions[type] || ''} ${Object.keys(people).length}</span>` : '').join('');
-    const quote = message.replyTo ? `<div class="reply-quote">Reply to ${escapeHtml(getNickname(message.replyTo.senderId))}: ${escapeHtml(replyPreview(message.replyTo))}</div>` : '';
-    const image = message.image ? `<img class="message-image" src="${escapeHtml(message.image)}" alt="Shared photo">` : '';
+    let quote = message.replyTo ? `<div class="reply-quote">Reply to ${escapeHtml(getNickname(message.replyTo.senderId))}: ${escapeHtml(replyPreview(message.replyTo))}</div>` : '';
+    let image = message.image ? (message.image.includes('/video/upload/') || message.image.match(/\.(mp4|webm|mov|ogg)$/i) ? `<video class="message-image" src="${escapeHtml(message.image)}" controls style="max-height:200px; max-width: 100%; border-radius: 8px; margin-top: 4px;"></video>` : `<img class="message-image" src="${escapeHtml(message.image)}" alt="Shared photo">`) : '';
+    let messageText = linkifyText(message.text || '');
+    
+    if (message.isDeleted) {
+      quote = '';
+      image = '';
+      messageText = '<span style="font-style:italic; opacity:0.6;">🚫 Message deleted</span>';
+    }
     
     let seen = '';
     if (state.activeInboxItem?.isGroup) {
@@ -240,7 +253,7 @@ function renderMessages(rawMessages, jumpToLatest = false) {
     }
     
     const senderNameHtml = (state.activeInboxItem?.isGroup && !mine) ? `<div class="message-sender-name" style="font-size:10px; color:var(--muted); margin-bottom:2px; margin-left:4px;">${escapeHtml(getNickname(message.senderId))}</div>` : '';
-    return `<div class="message-row${mine ? ' me' : ''}"><div>${senderNameHtml}<div class="message-bubble" data-message="${escapeHtml(message.id)}">${quote}${linkifyText(message.text || '')}${image}</div><div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div>${reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}</div></div>`;
+    return `<div class="message-row${mine ? ' me' : ''}"><div>${senderNameHtml}<div class="message-bubble" data-message="${escapeHtml(message.id)}">${quote}${messageText}${image}</div><div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div>${reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}</div></div>`;
   }).join('');
   wireMessageGestures(rows);
   if (jumpToLatest || wasNearLatest) requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
@@ -251,7 +264,7 @@ function showMessageMenu(message, x, y) {
   if (!message) return;
   const menu = $('message-action-menu');
   const reactionButtons = Object.entries(reactions).map(([type, emoji]) => `<button class="reaction-option" type="button" data-menu-action="react" data-reaction="${type}" aria-label="React ${type}">${emoji}</button>`).join('');
-  menu.innerHTML = `${reactionButtons}<span class="menu-separator"></span><button type="button" data-menu-action="reply">Reply</button>${message.senderId === state.user?.uid ? '<button type="button" data-menu-action="edit">Edit</button>' : ''}`;
+  menu.innerHTML = `${reactionButtons}<span class="menu-separator"></span><button type="button" data-menu-action="reply">Reply</button><button type="button" data-menu-action="copy">Copy</button>${message.senderId === state.user?.uid ? '<button type="button" data-menu-action="edit">Edit</button><button type="button" data-menu-action="delete" style="color: #dc2626;">Delete</button>' : ''}`;
   menu.classList.remove('hidden');
   menu.style.left = `${Math.max(12, Math.min(x, window.innerWidth - menu.offsetWidth - 12))}px`;
   menu.style.top = `${Math.max(12, Math.min(y, window.innerHeight - menu.offsetHeight - 12))}px`;
@@ -259,19 +272,66 @@ function showMessageMenu(message, x, y) {
     const action = button.dataset.menuAction;
     if (action === 'react') await toggleReaction(message.id, button.dataset.reaction);
     if (action === 'reply') setReply(message);
+    if (action === 'copy') {
+      try {
+        await navigator.clipboard.writeText(message.text || '');
+        showToast('Message copied.');
+      } catch (e) { showToast('Could not copy text.'); }
+    }
     if (action === 'edit') await editMessage(message);
+    if (action === 'delete') await deleteMessage(message);
     closeMessageMenu();
   }));
 }
 
 function openImageViewer(src) {
   const viewer = $('image-viewer');
-  $('image-viewer-img').src = src;
-  $('image-viewer-save').href = src;
+  const img = $('image-viewer-img');
+  const vid = $('image-viewer-video');
+  const saveBtn = $('image-viewer-save');
+  const isVideo = src.includes('/video/upload/') || /\.(mp4|webm|mov|ogg)$/i.test(src);
+  if (isVideo) {
+    img.style.display = 'none';
+    img.src = '';
+    vid.style.display = '';
+    vid.src = src;
+  } else {
+    vid.style.display = 'none';
+    vid.src = '';
+    vid.pause();
+    img.style.display = '';
+    img.src = src;
+  }
+  // Generate unique filename based on current date/time
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+  const timeStr = `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  const uniqueName = `chat_${dateStr}_${timeStr}`;
+
+  // Reset save button while blob is fetched
+  saveBtn.href = '#';
+  saveBtn.download = uniqueName;
+  fetch(src)
+    .then(res => res.blob())
+    .then(blob => {
+      const blobUrl = URL.createObjectURL(blob);
+      saveBtn.href = blobUrl;
+    })
+    .catch(() => {
+      // Fallback: direct link (may open new tab for cross-origin)
+      saveBtn.href = src;
+    });
   viewer.classList.remove('hidden');
 }
 function closeImageViewer() {
+  const saveBtn = $('image-viewer-save');
+  if (saveBtn.href && saveBtn.href.startsWith('blob:')) URL.revokeObjectURL(saveBtn.href);
+  saveBtn.href = '#';
   $('image-viewer').classList.add('hidden');
+  const vid = $('image-viewer-video');
+  vid.pause();
+  vid.src = '';
   $('image-viewer-img').src = '';
 }
 
@@ -296,8 +356,12 @@ function wireMessageGestures(rows) {
     bubble.addEventListener('click', (event) => { if (pressed) event.preventDefault(); });
   });
   // Wire image tap-to-view
-  $('message-list').querySelectorAll('.message-image').forEach((img) => {
+  $('message-list').querySelectorAll('img.message-image').forEach((img) => {
     img.addEventListener('click', (e) => { e.stopPropagation(); openImageViewer(img.src); });
+  });
+  // Wire video tap-to-fullview
+  $('message-list').querySelectorAll('video.message-image').forEach((vid) => {
+    vid.addEventListener('click', (e) => { e.stopPropagation(); openImageViewer(vid.src); });
   });
 }
 
@@ -342,7 +406,14 @@ function openThread(threadId, inboxItem) {
   state.activePeerId = state.activeInboxItem.isGroup ? null : state.activeInboxItem.peerId;
   $('empty-state').classList.add('hidden'); $('active-chat').classList.remove('hidden'); updateChatHeader(); renderConversations(); markThreadRead(threadId);
   if (state.stopMessages) state.stopMessages();
-  state.messages = {}; state.messagesLoaded = false; $('message-list').innerHTML = '<p class="list-empty messages-empty">Loading recent messages…</p>';
+  state.messages = {}; state.messagesLoaded = false;
+  $('message-list').innerHTML = `<div class="msg-skeleton-list">
+    <div class="msg-skeleton-row"><div class="msg-skeleton-avatar skeleton"></div><div class="msg-skeleton-body"><div class="msg-skeleton-bubble skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>
+    <div class="msg-skeleton-row me"><div class="msg-skeleton-body"><div class="msg-skeleton-bubble skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>
+    <div class="msg-skeleton-row"><div class="msg-skeleton-avatar skeleton"></div><div class="msg-skeleton-body"><div class="msg-skeleton-bubble short skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>
+    <div class="msg-skeleton-row me"><div class="msg-skeleton-body"><div class="msg-skeleton-bubble skeleton"></div><div class="msg-skeleton-bubble short skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>
+    <div class="msg-skeleton-row"><div class="msg-skeleton-avatar skeleton"></div><div class="msg-skeleton-body"><div class="msg-skeleton-bubble skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>
+  </div>`;
   state.stopMessages = onValue(query(ref(db, `chatMessages/${threadId}`), limitToLast(60)), (snapshot) => { const firstLoad = !state.messagesLoaded; state.messagesLoaded = true; renderMessages(snapshot.val(), firstLoad); markThreadSeen(threadId); });
   watchTyping(threadId); watchSeen(threadId); syncThreadSummaryWatchers(); $('message-input').focus();
 }
@@ -395,12 +466,58 @@ function compressImage(file) {
   });
 }
 
-async function useUploadQuota() {
-  const day = new Date().toISOString().slice(0, 10); const result = await runTransaction(ref(db, `chatUploadQuota/${state.user.uid}/${day}`), (count) => (Number(count || 0) >= 3 ? undefined : Number(count || 0) + 1));
-  if (!result.committed) throw new Error('Daily photo limit reached (3 uploads). Try again tomorrow.');
+function uploadToCloudinary(fileOrBase64, onProgress) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.cloudinary.com/v1_1/${cloudinaryConfig.cloudName}/auto/upload`;
+    const formData = new FormData();
+    formData.append('file', fileOrBase64);
+    formData.append('upload_preset', cloudinaryConfig.uploadPreset);
+    
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          onProgress(percent);
+        }
+      };
+    }
+    
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          resolve(data.secure_url);
+        } catch (err) {
+          reject(new Error('Invalid response from Cloudinary'));
+        }
+      } else {
+        reject(new Error('Failed to upload media to Cloudinary'));
+      }
+    };
+    
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+    xhr.send(formData);
+  });
 }
 
-function clearAttachment() { $('image-input').value = ''; state.pendingImageFile = null; }
+async function useUploadQuota() {
+  const day = new Date().toISOString().slice(0, 10); const result = await runTransaction(ref(db, `chatUploadQuota/${state.user.uid}/${day}`), (count) => (Number(count || 0) >= 10 ? undefined : Number(count || 0) + 1));
+  if (!result.committed) throw new Error('Daily photo limit reached (10 uploads). Try again tomorrow.');
+}
+async function useVideoUploadQuota() {
+  const day = new Date().toISOString().slice(0, 10); const result = await runTransaction(ref(db, `chatVideoUploadQuota/${state.user.uid}/${day}`), (count) => (Number(count || 0) >= 3 ? undefined : Number(count || 0) + 1));
+  if (!result.committed) throw new Error('Daily video limit reached (3 uploads). Try again tomorrow.');
+}
+
+function clearAttachment() { 
+  $('image-input').value = ''; 
+  state.pendingImageFile = null; 
+  $('media-preview-banner').classList.add('hidden');
+  $('media-preview-content').innerHTML = '';
+}
 function resetComposer() { $('message-input').value = ''; $('message-input').style.height = ''; clearAttachment(); clearReply(); setTyping(false); $('message-input').focus(); }
 async function updateConversationSummaries(preview, timestamp) {
   const own = { ...(state.inbox[state.activeThreadId] || {}), lastMessage: preview, lastTimestamp: timestamp, lastSenderId: state.user.uid, unreadCount: 0 };
@@ -426,17 +543,34 @@ async function updateConversationSummaries(preview, timestamp) {
 async function sendMessage(event) {
   event.preventDefault(); if (!state.user || !state.activeThreadId) return;
   const input = $('message-input'); const text = input.value.trim(); const file = state.pendingImageFile; if (!text && !file) return;
-  const button = $('send-button'); button.disabled = true;
+  const button = $('send-button'); 
+  button.disabled = true;
+  const originalButtonHtml = button.innerHTML;
+  
   try {
-    const image = file ? await compressImage(file) : null; if (image) await useUploadQuota();
+    let image = null;
+    const progressCallback = (percent) => { button.innerHTML = `<span style="font-size:10px">${percent}%</span>`; };
+    if (file) {
+      button.innerHTML = '<span style="font-size:10px">0%</span>';
+      if (file.type.startsWith('video/')) {
+        image = await uploadToCloudinary(file, progressCallback);
+        await useVideoUploadQuota();
+      } else {
+        const base64Img = await compressImage(file);
+        image = await uploadToCloudinary(base64Img, progressCallback);
+        await useUploadQuota();
+      }
+    }
+    button.innerHTML = originalButtonHtml;
     const timestamp = Date.now(); const payload = { senderId: state.user.uid, text, timestamp };
     if (image) payload.image = image;
     if (state.replyTo) payload.replyTo = { id: state.replyTo.id, senderId: state.replyTo.senderId, text: (state.replyTo.text || '').slice(0, 120), hasImage: Boolean(state.replyTo.image) };
     await push(ref(db, `chatMessages/${state.activeThreadId}`), payload);
     resetComposer();
-    try { await updateConversationSummaries(text || '📷 Photo', timestamp); } catch (error) { console.error('Message was sent, but its inbox summary failed:', error); }
+    try { await updateConversationSummaries(text || (file?.type.startsWith('video/') ? '🎥 Video' : '📷 Photo'), timestamp); } catch (error) { console.error('Message was sent, but its inbox summary failed:', error); }
   } catch (error) {
-    if (file && /Daily photo limit reached/.test(error.message)) { clearAttachment(); showToast('Daily photo limit reached. The photo was removed—your text is ready to send.'); }
+    button.innerHTML = originalButtonHtml;
+    if (file && /limit reached/.test(error.message)) { clearAttachment(); showToast(error.message + ' The media was removed—your text is ready to send.'); }
     else showToast(`Could not send: ${error.message.replace('Firebase: ', '')}`);
   }
   button.disabled = false;
@@ -460,6 +594,22 @@ async function editMessage(message) {
     updateConversationSummaries(newText.trim(), Date.now());
     showToast('Message edited.');
   } catch (err) { showToast('Could not edit message.'); }
+}
+
+async function deleteMessage(message) {
+  const confirmDelete = await showAppModal({
+    title: 'Delete Message',
+    message: 'Are you sure you want to delete this message?',
+    confirmText: 'Delete',
+    danger: true
+  });
+  if (!confirmDelete) return;
+  try {
+    await update(ref(db, `chatMessages/${state.activeThreadId}/${message.id}`), { isDeleted: true });
+    showToast('Message deleted.');
+  } catch (err) {
+    showToast('Could not delete message. Check permissions.');
+  }
 }
 
 function setTyping(active) {
@@ -510,8 +660,13 @@ function stopThreadSummaryWatchers() {
   Object.values(state.stopThreadSummaries).forEach((stop) => stop());
   state.stopThreadSummaries = {};
 }
+function saveInboxCache() {
+  if (state.user) localStorage.setItem(`hangout-inbox-${state.user.uid}`, JSON.stringify(state.inbox));
+}
+
 function syncThreadSummaryWatchers() {
-  const threadIds = new Set(state.activeThreadId ? [state.activeThreadId] : []);
+  const threadIds = new Set(Object.keys(state.inbox));
+  if (state.activeThreadId) threadIds.add(state.activeThreadId);
   Object.entries(state.stopThreadSummaries).forEach(([threadId, stop]) => {
     if (!threadIds.has(threadId)) { stop(); delete state.stopThreadSummaries[threadId]; }
   });
@@ -519,39 +674,17 @@ function syncThreadSummaryWatchers() {
     if (state.stopThreadSummaries[threadId]) return;
     state.stopThreadSummaries[threadId] = onValue(ref(db, `chatThreads/${threadId}`), (snapshot) => {
       const thread = snapshot.val(); const current = state.inbox[threadId];
-      if (!thread || !current || Number(thread.lastTimestamp || 0) < Number(current.lastTimestamp || 0)) return;
+      if (!thread || !current) return;
       const next = { ...current, lastMessage: thread.lastMessage || '', lastTimestamp: thread.lastTimestamp || 0, lastSenderId: thread.lastSenderId || '', nicknames: thread.nicknames || {}, members: thread.members || {}, creatorId: thread.creatorId || current.creatorId || '', name: thread.name || current.name || '', pic: thread.pic || current.pic || '' };
       if (next.lastMessage === current.lastMessage && next.lastTimestamp === current.lastTimestamp && next.lastSenderId === current.lastSenderId && JSON.stringify(next.nicknames) === JSON.stringify(current.nicknames || {}) && next.name === (current.name || '') && JSON.stringify(next.members) === JSON.stringify(current.members || '') && next.pic === (current.pic || '')) return;
       state.inbox = { ...state.inbox, [threadId]: next };
       if (state.activeThreadId === threadId) { state.activeInboxItem = next; updateChatHeader(); renderMessages(state.messages); }
+      saveInboxCache();
       renderConversations();
     }, (error) => reportRealtimeError('conversation summary', error));
   });
 }
-async function loadThreadMetadata(threadId) {
-  if (state.inbox[threadId]?.metadataLoaded) return;
-  try {
-    const snapshot = await get(ref(db, `chatThreads/${threadId}`));
-    if (snapshot.exists()) {
-      const thread = snapshot.val();
-      const current = state.inbox[threadId];
-      if (!current) return;
-      current.name = thread.name || '';
-      current.pic = thread.pic || '';
-      current.creatorId = thread.creatorId || '';
-      current.members = thread.members || {};
-      current.nicknames = thread.nicknames || {};
-      current.metadataLoaded = true;
-      renderConversations();
-      if (state.activeThreadId === threadId) {
-        state.activeInboxItem = current;
-        updateChatHeader();
-      }
-    }
-  } catch (err) {
-    console.error("Failed to load thread metadata:", err);
-  }
-}
+
 
 function handleInbox(snapshot) {
   const previous = state.inbox; const next = snapshot.val() || {};
@@ -566,6 +699,7 @@ function handleInbox(snapshot) {
     }
   });
   state.inbox = next;
+  saveInboxCache();
   if (state.inboxReady && state.user) Object.entries(next).forEach(([threadId, item]) => {
     const before = previous[threadId];
     if (item.lastSenderId !== state.user.uid && Number(item.lastTimestamp || 0) > Number(before?.lastTimestamp || 0)) showToast(`New message from ${state.users[item.peerId]?.name || 'a member'}`);
@@ -575,13 +709,6 @@ function handleInbox(snapshot) {
   renderConversations(); 
   updateUnreadTitle(); 
   markThreadRead();
-  
-  // Fetch metadata once for any threads that need it
-  Object.keys(next).forEach(threadId => {
-    if (!next[threadId].metadataLoaded) {
-      loadThreadMetadata(threadId);
-    }
-  });
 }
 
 onValue(ref(db, 'users'), (snapshot) => { const raw = snapshot.val() || {}; state.users = Object.fromEntries(Object.entries(raw).map(([uid, profile]) => [uid, { ...(profile || {}), uid }])); renderConversations(); renderPeople(); updateChatHeader(); }, (error) => reportRealtimeError('member list', error));
@@ -608,13 +735,46 @@ $('message-input').addEventListener('keydown', (event) => { if (event.key === 'E
 } });
 $('send-button').addEventListener('mousedown', e => e.preventDefault());
 $('send-button').addEventListener('touchstart', e => { if (e.cancelable) e.preventDefault(); if (!$('send-button').disabled) $('message-form').requestSubmit(); }, { passive: false });
-$('image-input').addEventListener('change', (event) => { const file = event.target.files[0]; state.pendingImageFile = file || null; if (file) showToast(`Photo ready: ${file.name}. Limit: 3 uploads daily.`); });
+$('image-input').addEventListener('change', (event) => { 
+  const file = event.target.files[0]; 
+  
+  if (file && file.type.startsWith('video/') && file.size > 20 * 1024 * 1024) {
+    showToast("Video is too large. Max size is 20MB.");
+    event.target.value = '';
+    return;
+  }
+  
+  state.pendingImageFile = file || null; 
+  
+  if (file) {
+    showToast(`Media ready: ${file.name}. Limit: 10 images or 3 videos daily.`);
+    
+    $('media-preview-content').innerHTML = '';
+    if (file.type.startsWith('video/')) {
+        const video = document.createElement('video');
+        video.src = URL.createObjectURL(file);
+        video.style.maxHeight = '100px';
+        video.style.borderRadius = '8px';
+        $('media-preview-content').appendChild(video);
+    } else {
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(file);
+        img.style.maxHeight = '100px';
+        img.style.borderRadius = '8px';
+        $('media-preview-content').appendChild(img);
+    }
+    $('media-preview-banner').classList.remove('hidden');
+  } else {
+    clearAttachment();
+  }
+});
 $('group-photo-input')?.addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file || !state.activeThreadId || !state.activeInboxItem?.isGroup) return;
   if (state.activeInboxItem.creatorId !== state.user.uid) return showToast('Only the creator can set the group photo.');
   try {
-    const b64 = await compressImage(file);
+    const base64Img = await compressImage(file);
+    const b64 = await uploadToCloudinary(base64Img);
     await update(ref(db, `chatThreads/${state.activeThreadId}`), { pic: b64 });
     showToast('Group photo updated.');
     $('conversation-dialog').close();
@@ -622,6 +782,7 @@ $('group-photo-input')?.addEventListener('change', async (event) => {
   event.target.value = '';
 });
 $('cancel-reply-button').addEventListener('click', clearReply);
+$('cancel-media-button')?.addEventListener('click', clearAttachment);
 $('mobile-back-button').addEventListener('click', closeActiveChat);
 $('conversation-options-button').addEventListener('click', () => {
   const isGroup = state.activeInboxItem?.isGroup;

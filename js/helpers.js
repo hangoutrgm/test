@@ -94,9 +94,17 @@ window.viewImage = (src) => {
     document.getElementById('viewer-img').src = src;
     document.getElementById('image-viewer-modal').classList.remove('hidden');
     
+    // Generate unique filename based on current date/time
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+    const timeStr = `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+    const uniqueName = `hangout_${dateStr}_${timeStr}`;
+    
     // Attempt to fetch image as blob to allow download for cross-origin images
     const downloadBtn = document.getElementById('viewer-download-btn');
     downloadBtn.href = '#';
+    downloadBtn.download = uniqueName;
     fetch(src)
         .then(res => res.blob())
         .then(blob => {
@@ -144,6 +152,28 @@ window.compressImage = (file, heavy = false) => {
     });
 };
 
+window.uploadToCloudinary = async (fileOrBase64) => {
+    const cloudName = "rlnbst7h";
+    const uploadPreset = "hangout-images";
+    const url = `https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`;
+    
+    const formData = new FormData();
+    formData.append('file', fileOrBase64);
+    formData.append('upload_preset', uploadPreset);
+    
+    const response = await fetch(url, {
+        method: 'POST',
+        body: formData
+    });
+    
+    if (!response.ok) {
+        throw new Error('Failed to upload media to Cloudinary');
+    }
+    
+    const data = await response.json();
+    return data.secure_url;
+};
+
 window.handleDeepLinks = () => {
     if (window.initialLinkDone) return;
     const params = new URLSearchParams(window.location.search);
@@ -169,6 +199,12 @@ window.formatText = (text) => {
     formatted = formatted.replace(urlRegex, function(url) {
         return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-blue-500 hover:underline break-all">${url}</a>`;
     });
+
+    // Highlight @everyone
+    formatted = formatted.replace(/@everyone(?![\w])/gi, `<span class="text-red-500 font-bold">@everyone</span>`);
+
+    // Highlight @mods
+    formatted = formatted.replace(/@mods(?![\w])/gi, `<span class="text-green-500 font-bold">@mods</span>`);
 
     const sortedUsers = Object.keys(window.globalUsersCache)
         .map(uid => ({uid, name: window.globalUsersCache[uid].name}))

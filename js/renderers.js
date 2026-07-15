@@ -1,5 +1,5 @@
 import { db } from "./firebase-config.js";
-import { ref, update, set, push, remove, increment, get } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { ref, update, set, push, remove, increment, get, onValue } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 
 // Notifications
 window.updateNotifBadge = () => {
@@ -43,15 +43,26 @@ window.renderNotifications = () => {
             else if(n.type === 'mention') { text = 'mentioned you.'; icon = '📣'; }
             else if(n.type === 'follow') { 
                 text = 'started following you.'; icon = '👥'; 
-                linkAction = `onclick="window.openProfile('${n.sourceUid}'); document.getElementById('notif-modal').classList.add('hidden'); window.markNotifRead('${n.id}');"`; 
+                linkAction = `onclick="window.openProfile('${n.sourceUid}'); document.getElementById('notif-modal').classList.add('hidden'); window.markNotifRead('${n.id}');"`;
+            }
+
+            // Format timestamp
+            let timeDisplay = '';
+            if (n.timestamp) {
+                const d = new Date(n.timestamp);
+                const fullDate = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                timeDisplay = `<span class="text-gray-400 dark:text-gray-500 text-[9px] mt-0.5 block" title="${fullDate}">${window.timeAgo(n.timestamp)} ago • ${fullDate}</span>`;
             }
 
             return `
             <div class="flex items-center p-2.5 rounded-lg mb-1 border border-gray-100 dark:border-slate-700/50 ${n.read ? 'bg-gray-50 dark:bg-slate-900/50 opacity-80' : 'bg-blue-50 dark:bg-blue-900/20'} hover:opacity-100 cursor-pointer transition shadow-sm" ${linkAction}>
                 <img src="${u.pic}" loading="lazy" class="w-8 h-8 rounded-full object-cover mr-3 shrink-0 border border-gray-200 dark:border-slate-600" onclick="event.stopPropagation(); window.openProfile('${n.sourceUid}'); document.getElementById('notif-modal').classList.add('hidden'); window.markNotifRead('${n.id}');">
-                <div class="flex-1 text-[11px] leading-tight">
-                    <span class="font-bold text-gray-900 dark:text-white hover:underline" onclick="event.stopPropagation(); window.openProfile('${n.sourceUid}'); document.getElementById('notif-modal').classList.add('hidden'); window.markNotifRead('${n.id}');">${u.name}</span>
-                    <span class="text-gray-600 dark:text-gray-300 font-normal">${text}</span>
+                <div class="flex-1 text-[11px] leading-tight min-w-0">
+                    <div>
+                        <span class="font-bold text-gray-900 dark:text-white hover:underline" onclick="event.stopPropagation(); window.openProfile('${n.sourceUid}'); document.getElementById('notif-modal').classList.add('hidden'); window.markNotifRead('${n.id}');">${u.name}</span>
+                        <span class="text-gray-600 dark:text-gray-300 font-normal"> ${text}</span>
+                    </div>
+                    ${timeDisplay}
                 </div>
                 <div class="text-lg ml-2 shrink-0">${icon}</div>
             </div>
@@ -61,11 +72,17 @@ window.renderNotifications = () => {
 };
 
 // Profile UI
+
+
 window.openProfile = (uid) => {
     document.getElementById('members-modal').classList.add('hidden');
     document.getElementById('main-view').classList.add('hidden');
     document.getElementById('profile-view').classList.remove('hidden');
     window.activeProfileUid = uid;
+    window.postLimit = 15;
+    window.hasMorePosts = true;
+    if (window.listenPosts) window.listenPosts();
+    // Initial render will be handled by listenPosts response, but render the skeleton/header now:
     window.renderProfileData(true);
     window.scrollTo(0,0);
 };
@@ -74,7 +91,9 @@ window.closeProfile = () => {
     document.getElementById('profile-view').classList.add('hidden');
     document.getElementById('main-view').classList.remove('hidden');
     window.activeProfileUid = null;
-    window.renderFeed(false);
+    window.postLimit = 15;
+    window.hasMorePosts = true;
+    if (window.listenPosts) window.listenPosts();
     window.history.replaceState({}, document.title, window.location.pathname);
 };
 
@@ -89,6 +108,10 @@ window.goToPost = (postId) => {
 window.clearIsolatedPost = () => {
     window.isolatedPostId = null;
     window.feedRenderLimit = 15;
+    if (window.isolatedPostUnsubscribe) {
+        window.isolatedPostUnsubscribe();
+        window.isolatedPostUnsubscribe = null;
+    }
     window.renderFeed(true);
 };
 
@@ -103,6 +126,7 @@ window.openEditProfile = () => {
     document.getElementById('profile-gender').value = cache.gender || '';
     document.getElementById('profile-relationship').value = cache.relationship || '';
     document.getElementById('profile-partner').value = cache.partner || '';
+    document.getElementById('profile-bio').value = cache.bio || '';
     document.getElementById('profile-relationship').dispatchEvent(new Event('change'));
 
     // Build gallery slots
@@ -129,7 +153,8 @@ window.openEditProfile = () => {
         slot.querySelector('.gallery-file-input').addEventListener('change', async function() {
             const file = this.files[0]; if(!file) return;
             try {
-                const compressed = await window.compressImage(file);
+                const base64Img = await window.compressImage(file);
+                const compressed = await window.uploadToCloudinary(base64Img);
                 slot.querySelector('.gallery-url-input').value = compressed;
                 // Update preview
                 let prev = slot.querySelector('.gallery-slot-preview');
@@ -222,17 +247,27 @@ window.renderFeed = (resetLimit = true) => {
                 <i class="fa-solid fa-spinner fa-spin text-2xl mb-2 text-blue-600"></i>
                 <p>Loading spotlight post...</p>
             </div>`;
-            get(ref(db, `community_posts/${window.isolatedPostId}`)).then((snapshot) => {
+            if (window.isolatedPostUnsubscribe) window.isolatedPostUnsubscribe();
+            
+            window.isolatedPostUnsubscribe = onValue(ref(db, `community_posts/${window.isolatedPostId}`), (snapshot) => {
                 if (snapshot.exists()) {
                     const post = { id: snapshot.key, ...snapshot.val() };
-                    window.historicalPosts.push(post);
-                    window.allPosts = [...window.historicalPosts, ...window.livePosts];
-                    window.renderFeed(false);
+                    
+                    const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
+                    if (existingIndex >= 0) {
+                        window.allPosts[existingIndex] = post;
+                    } else {
+                        window.allPosts.push(post);
+                    }
+
+                    if (!window.isUserTyping) {
+                        window.renderFeed(false);
+                    }
                 } else {
                     feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
                     <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
                 }
-            }).catch((err) => {
+            }, (err) => {
                 console.error("Error fetching isolated post:", err);
                 feed.innerHTML = `<p class="text-center text-gray-500 py-10">Failed to load post.</p>
                 <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
@@ -405,6 +440,8 @@ window.renderProfileData = (resetLimit = true) => {
             
             ${isBanned ? '<span class="bg-red-500 text-white text-[10px] font-bold px-2 py-0.5 rounded uppercase mt-1">Banned</span>' : ''}
             <p class="text-sm text-gray-500 mt-1"><span class="text-yellow-500">⭐ ${uData.points || 0}</span> • <span class="text-blue-500">👥 ${followerCount}</span> Followers</p>
+            
+            ${uData.bio ? `<div class="mt-2 w-fit mx-auto px-3 py-2 rounded-lg bg-gray-50 dark:bg-slate-900/60 border-l-2 border-blue-400 dark:border-blue-500 text-[0.9rem] text-gray-600 dark:text-gray-300 italic text-center shadow-inner" style="line-height: 0.9;"><i class="fa-solid fa-quote-left text-blue-300 dark:text-blue-600 mr-1 text-[9px]"></i>${uData.bio}<i class="fa-solid fa-quote-right text-blue-300 dark:text-blue-600 ml-1 text-[9px]"></i></div>` : ''}
             
             ${relStr}
             ${followBtn}
@@ -839,7 +876,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
         
         <div id="post-body-${prefix}-${post.id}">
             ${post.text ? `<p class="text-sm text-gray-800 dark:text-gray-200 mb-1 whitespace-pre-wrap break-words leading-snug">${safePostText} ${post.edited ? '<span class="text-[10px] italic text-gray-400 ml-1 font-normal">(edited)</span>' : ''}</p>${window.generateEmbed(post.text)}` : ''}
-            ${post.image ? `<img src="${post.image}" loading="lazy" class="w-full rounded-lg mb-2 object-cover max-h-80 border border-gray-100 dark:border-slate-700 shadow-sm mt-2 cursor-pointer hover:opacity-90 transition" onclick="window.viewImage('${post.image}')">` : ''}
+            ${post.image ? ((post.image.includes('/video/upload/') || post.image.match(/\.(mp4|webm|mov|ogg)$/i)) ? `<video src="${post.image}" controls class="w-full rounded-lg mb-2 max-h-96 bg-black mt-2"></video>` : `<img src="${post.image}" loading="lazy" class="w-full rounded-lg mb-2 object-cover max-h-80 border border-gray-100 dark:border-slate-700 shadow-sm mt-2 cursor-pointer hover:opacity-90 transition" onclick="window.viewImage('${post.image}')">`) : ''}
         </div>
         
         <div id="reactions-${prefix}-${post.id}" class="flex items-center justify-between border-t border-gray-100 dark:border-slate-700 pt-2 text-xs pb-1 mt-1">

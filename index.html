@@ -55,8 +55,9 @@
                     <i class="fa-solid fa-search absolute left-3 top-2.5 text-gray-400 text-sm"></i>
                     <input type="text" id="post-search" placeholder="Search posts or authors..." class="w-full bg-white dark:bg-slate-800 text-sm pl-9 pr-3 py-2 rounded-lg dark:text-white focus:outline-none shadow-sm border border-gray-200 dark:border-slate-700">
                 </div>
-                <a href="chat/" class="shrink-0 bg-blue-600 hover:bg-blue-500 text-white w-[38px] h-[38px] flex items-center justify-center rounded-lg shadow-sm transition" title="Open Messenger">
+                <a href="chat/" class="shrink-0 bg-blue-600 hover:bg-blue-500 text-white w-[38px] h-[38px] flex items-center justify-center rounded-lg shadow-sm transition relative" title="Open Messenger">
                     <i class="fa-solid fa-comments text-lg"></i>
+                    <span id="chat-unread-badge" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full shadow border-2 border-white dark:border-slate-800 hidden">0</span>
                 </a>
             </div>
 
@@ -75,11 +76,12 @@
                 <div class="flex items-center space-x-2 mt-2">
                     <label class="cursor-pointer text-gray-500 hover:text-blue-500 transition p-1.5 bg-gray-100 dark:bg-slate-700 rounded-lg shrink-0 border border-gray-200 dark:border-slate-600">
                         <i class="fa-solid fa-image text-lg"></i>
-                        <input type="file" id="post-image-file" accept="image/*" class="hidden" onchange="document.getElementById('file-name').innerText = this.files[0] ? this.files[0].name : ''">
+                        <input type="file" id="post-image-file" accept="image/*,video/*" class="hidden">
                     </label>
-                    <input type="text" id="post-image-url" class="flex-1 bg-gray-50 dark:bg-slate-900 text-[11px] text-gray-700 dark:text-gray-300 rounded-lg p-2 focus:outline-none border border-gray-100 dark:border-slate-700 focus:border-blue-500" placeholder="Or paste image URL...">
+                    <input type="text" id="post-image-url" class="flex-1 bg-gray-50 dark:bg-slate-900 text-[11px] text-gray-700 dark:text-gray-300 rounded-lg p-2 focus:outline-none border border-gray-100 dark:border-slate-700 focus:border-blue-500" placeholder="Or paste image/video URL...">
                 </div>
                 <div id="file-name" class="text-[9px] text-blue-500 truncate mt-1 font-bold px-1"></div>
+                <div id="media-preview-container" class="hidden mt-2"></div>
 
                 <div class="flex justify-between items-center mt-2 pt-2 border-t border-gray-100 dark:border-slate-700">
                     <select id="post-category" class="bg-gray-100 dark:bg-slate-700 text-gray-700 dark:text-gray-300 text-xs rounded p-1 focus:outline-none">
@@ -131,7 +133,7 @@
     <div id="image-viewer-modal" class="hidden fixed inset-0 z-[120] flex flex-col items-center justify-center p-2 bg-black/95 backdrop-blur-sm" onclick="window.closeImageViewer()">
         <button onclick="window.closeImageViewer()" class="absolute top-4 right-4 text-gray-400 hover:text-white z-10 transition p-2"><i class="fa-solid fa-xmark text-2xl"></i></button>
         <img id="viewer-img" src="" class="max-w-full max-h-[85vh] object-contain rounded-lg shadow-2xl transition-transform mb-4" onclick="event.stopPropagation()">
-        <a id="viewer-download-btn" href="#" download="hangout_image" onclick="event.stopPropagation()" class="bg-gray-800 hover:bg-gray-700 text-white px-5 py-2.5 rounded-full font-bold text-sm transition shadow-lg flex items-center space-x-2 border border-gray-700">
+        <a id="viewer-download-btn" href="#" onclick="event.stopPropagation()" class="bg-gray-800 hover:bg-gray-700 text-white px-5 py-2.5 rounded-full font-bold text-sm transition shadow-lg flex items-center space-x-2 border border-gray-700">
             <i class="fa-solid fa-download"></i> <span>Save Image</span>
         </a>
     </div>
@@ -256,6 +258,8 @@
             <input type="text" id="profile-partner" placeholder="Partner Name (e.g. @Gemini)" class="hidden w-full bg-gray-100 dark:bg-slate-900 text-[11px] p-2.5 rounded-lg mb-2 dark:text-white focus:outline-none border border-pink-200 dark:border-pink-900/50">
             <input type="text" id="profile-pic-url" placeholder="Profile Pic URL (Optional)" class="w-full bg-gray-100 dark:bg-slate-900 text-[10px] p-2.5 rounded-lg mb-3 dark:text-white focus:outline-none border border-gray-200 dark:border-slate-700">
             
+            <textarea id="profile-bio" placeholder="Write a short bio about yourself..." rows="2" class="w-full bg-gray-100 dark:bg-slate-900 text-[11px] p-2.5 rounded-lg mb-2 dark:text-white focus:outline-none border border-gray-200 dark:border-slate-700 resize-none leading-snug"></textarea>
+
             <div class="mb-3">
                 <p class="text-xs font-bold text-gray-500 mb-2"><i class="fa-solid fa-images text-blue-500 mr-1"></i> Photo Gallery (max 4)</p>
                 <div class="flex gap-2" id="gallery-slots">

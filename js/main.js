@@ -1,7 +1,7 @@
 // main.js
 import { app, auth, db } from "./firebase-config.js";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
-import { ref, push, onValue, get, set, update, remove, serverTimestamp, increment, onDisconnect, query, limitToLast, orderByKey, endBefore } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { ref, push, onValue, get, set, update, remove, serverTimestamp, increment, onDisconnect, query, limitToLast, orderByKey, endBefore, orderByChild, equalTo } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 import "./globals.js";
 import "./helpers.js";
 import "./renderers.js";
@@ -30,7 +30,10 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
         document.querySelectorAll('.filter-btn').forEach(b => { b.classList.remove('bg-blue-600', 'text-white'); b.classList.add('bg-gray-200', 'text-gray-700', 'dark:bg-slate-800', 'dark:text-gray-300'); });
         e.target.classList.add('bg-blue-600', 'text-white'); e.target.classList.remove('bg-gray-200', 'text-gray-700', 'dark:bg-slate-800', 'dark:text-gray-300');
         window.currentFilter = e.target.getAttribute('data-cat');
-        window.renderFeed(true);
+        window.postLimit = 15;
+        window.hasMorePosts = true;
+        window.listenPosts();
+        // Initial render will be handled by listenPosts onValue response
     });
 });
 
@@ -75,8 +78,8 @@ window.notifyMentions = (text, postId) => {
         });
     }
     
-    // Check for @mods
-    if (textLower.includes('@mods')) {
+    // Check for @mods — only mods/admins can use this
+    if (myRole >= 2 && textLower.includes('@mods')) {
         Object.keys(window.globalUsersCache).forEach(uid => {
             // Notify if user is Mod/Admin, not self, and not already notified
             if (uid !== window.currentUser.uid && !notifiedUids.has(uid) && window.getRole(uid).level >= 2) {
@@ -172,8 +175,8 @@ const setupMentionSystem = () => {
                 const allUsers = Object.values(window.globalUsersCache || {});
                 let matchedUsers = allUsers.filter(u => u.name && u.name.toLowerCase().includes(query)).slice(0, 5);
                 
-                // V6.9 FEATURE: @mods suggestion
-                if ("mods".includes(query)) {
+                // V6.9 FEATURE: @mods suggestion — only visible to mods/admins
+                if (myRole >= 2 && "mods".includes(query)) {
                     matchedUsers.unshift({ name: "mods", isMods: true });
                 }
                 
@@ -345,73 +348,69 @@ onValue(ref(db, 'users'), (snap) => {
     window.handleDeepLinks();
 });
 
-window.livePosts = [];
-window.historicalPosts = [];
+window.allPosts = [];
 window.isLoadingHistory = false;
 window.hasMorePosts = true;
+window.postLimit = 15;
+window.postsUnsubscribe = null;
+
+window.listenPosts = () => {
+    if (window.postsUnsubscribe) window.postsUnsubscribe();
+    
+    let dbQuery;
+    const postsRef = ref(db, 'community_posts');
+    if (window.activeProfileUid) {
+        dbQuery = query(postsRef, orderByChild('authorId'), equalTo(window.activeProfileUid), limitToLast(window.postLimit));
+    } else if (window.currentFilter === 'My Posts' && window.currentUser) {
+        dbQuery = query(postsRef, orderByChild('authorId'), equalTo(window.currentUser.uid), limitToLast(window.postLimit));
+    } else if (window.currentFilter && window.currentFilter !== 'All') {
+        dbQuery = query(postsRef, orderByChild('category'), equalTo(window.currentFilter), limitToLast(window.postLimit));
+    } else {
+        dbQuery = query(postsRef, limitToLast(window.postLimit));
+    }
+
+    window.postsUnsubscribe = onValue(dbQuery, (snapshot) => {
+        const newPosts = [];
+        snapshot.forEach(child => {
+            newPosts.push({ id: child.key, ...child.val() });
+        });
+
+        const oldData = JSON.stringify(window.allPosts);
+        const newData = JSON.stringify(newPosts);
+        if (oldData === newData) return;
+
+        if (newPosts.length < window.postLimit && window.postLimit > 15) {
+            window.hasMorePosts = false;
+        }
+
+        window.allPosts = newPosts;
+        
+        if (!window.isUserTyping) {
+            if (window.activeProfileUid) window.renderProfileData(false);
+            else window.renderFeed(false);
+        }
+        window.handleDeepLinks();
+    });
+};
 
 window.loadMorePosts = async () => {
     if (window.isLoadingHistory || !window.hasMorePosts) return;
     
-    // Find the oldest post ID we currently have
-    const allKnown = [...window.historicalPosts, ...window.livePosts].sort((a, b) => a.id < b.id ? -1 : (a.id > b.id ? 1 : 0));
-    if (allKnown.length === 0) return;
-    
-    const oldestId = allKnown[0].id;
     window.isLoadingHistory = true;
-    
-    // Show a small loader at the bottom
     const sentinel = document.querySelector('.sentinel-loader');
     if (sentinel) sentinel.innerHTML = '<span>Loading older posts...</span>';
     
-    try {
-        const snap = await get(query(ref(db, 'community_posts'), orderByKey(), endBefore(oldestId), limitToLast(15)));
-        const oldPosts = [];
-        snap.forEach(child => { oldPosts.push({ id: child.key, ...child.val() }); });
-        
-        if (oldPosts.length === 0) {
-            window.hasMorePosts = false;
-            if (sentinel) sentinel.innerHTML = '<span>No more posts to show.</span>';
-        } else {
-            // Prepend old posts to historicalPosts (so they stay at the bottom of the feed)
-            window.historicalPosts = [...oldPosts, ...window.historicalPosts];
-            window.allPosts = [...window.historicalPosts, ...window.livePosts];
-            if (!window.isUserTyping) {
-                if (window.activeProfileUid) window.renderProfileData(false);
-                else window.renderFeed(false);
-                window.handleDeepLinks();
-            }
-        }
-    } catch (err) {
-        console.error("Error loading historical posts:", err);
-    }
-    window.isLoadingHistory = false;
+    window.postLimit += 15;
+    window.listenPosts();
+    
+    setTimeout(() => {
+        window.isLoadingHistory = false;
+        if (sentinel && window.hasMorePosts) sentinel.innerHTML = '';
+        else if (sentinel && !window.hasMorePosts) sentinel.innerHTML = '<span>No more posts to show.</span>';
+    }, 1000);
 };
 
-onValue(query(ref(db, 'community_posts'), limitToLast(15)), (snapshot) => {
-    const newPosts = [];
-    snapshot.forEach(child => {
-        newPosts.push({ id: child.key, ...child.val() });
-    });
-
-    const oldData = JSON.stringify(window.livePosts);
-    const newData = JSON.stringify(newPosts);
-    if (oldData === newData) return;
-
-    window.livePosts = newPosts;
-    
-    // Merge history and live posts. Ensure we don't duplicate if history caught up to live.
-    const liveIds = new Set(window.livePosts.map(p => p.id));
-    const dedupedHistory = window.historicalPosts.filter(p => !liveIds.has(p.id));
-    
-    window.allPosts = [...dedupedHistory, ...window.livePosts];
-
-    if (!window.isUserTyping) {
-        if (window.activeProfileUid) window.renderProfileData(false);
-        else window.renderFeed(false);
-    }
-    window.handleDeepLinks();
-});
+window.listenPosts();
 
 // ==========================================
 // ==========================================
@@ -423,8 +422,8 @@ window.checkUploadLimit = () => {
     const today = new Date().toLocaleDateString('en-CA');
     const userData = window.globalUsersCache[window.currentUser.uid] || {};
     const uploadsToday = userData.dailyUploads?.date === today ? userData.dailyUploads.count : 0;
-    if (uploadsToday >= 5) {
-        window.showAlert("You have reached your daily limit of 5 image uploads.");
+    if (uploadsToday >= 10) {
+        window.showAlert("You have reached your daily limit of 10 image uploads.");
         return false;
     }
     return true;
@@ -438,6 +437,59 @@ window.incrementUploadLimit = () => {
     update(ref(db, `users/${window.currentUser.uid}/dailyUploads`), { date: today, count: currentCount + 1 });
 };
 
+window.checkVideoUploadLimit = () => {
+    if (!window.currentUser) return false;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const uploadsToday = userData.dailyVideoUploads?.date === today ? userData.dailyVideoUploads.count : 0;
+    if (uploadsToday >= 3) {
+        window.showAlert("You have reached your daily limit of 3 video uploads.");
+        return false;
+    }
+    return true;
+};
+
+window.incrementVideoUploadLimit = () => {
+    if (!window.currentUser) return;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const currentCount = userData.dailyVideoUploads?.date === today ? (userData.dailyVideoUploads.count || 0) : 0;
+    update(ref(db, `users/${window.currentUser.uid}/dailyVideoUploads`), { date: today, count: currentCount + 1 });
+};
+
+document.getElementById('post-image-file').addEventListener('change', function() {
+    const file = this.files[0];
+    document.getElementById('file-name').innerText = file ? file.name : '';
+    const previewContainer = document.getElementById('media-preview-container');
+    previewContainer.innerHTML = '';
+    
+    if (file) {
+        if (file.type.startsWith('video/')) {
+            if (file.size > 20 * 1024 * 1024) {
+                window.showAlert("Video is too large. Max size is 20MB.");
+                this.value = '';
+                document.getElementById('file-name').innerText = '';
+                previewContainer.classList.add('hidden');
+                return;
+            }
+            previewContainer.classList.remove('hidden');
+            const video = document.createElement('video');
+            video.src = URL.createObjectURL(file);
+            video.controls = true;
+            video.className = "w-full max-h-48 object-contain rounded bg-black";
+            previewContainer.appendChild(video);
+        } else if (file.type.startsWith('image/')) {
+            previewContainer.classList.remove('hidden');
+            const img = document.createElement('img');
+            img.src = URL.createObjectURL(file);
+            img.className = "w-full max-h-48 object-contain rounded bg-gray-100 dark:bg-slate-800";
+            previewContainer.appendChild(img);
+        }
+    } else {
+        previewContainer.classList.add('hidden');
+    }
+});
+
 document.getElementById('submit-post-btn').addEventListener('click', async () => {
     if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
     if (window.checkBan()) return; 
@@ -449,7 +501,17 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
     
     if (!text && !imgUrl && !file) return;
     
-    if (file && !window.checkUploadLimit()) return;
+    let isVideo = false;
+    if (file) {
+        isVideo = file.type.startsWith('video/');
+        if (isVideo && !window.checkVideoUploadLimit()) return;
+        if (!isVideo && !window.checkUploadLimit()) return;
+        
+        if (isVideo && file.size > 20 * 1024 * 1024) {
+            window.showAlert("Video is too large. Max size is 20MB.");
+            return;
+        }
+    }
     
     const btn = document.getElementById('submit-post-btn');
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
@@ -459,8 +521,14 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
         let finalImage = imgUrl; 
         if (file) {
             btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
-            finalImage = await window.compressImage(file); 
-            window.incrementUploadLimit();
+            if (isVideo) {
+                finalImage = await window.uploadToCloudinary(file);
+                window.incrementVideoUploadLimit();
+            } else {
+                const base64Img = await window.compressImage(file); 
+                finalImage = await window.uploadToCloudinary(base64Img);
+                window.incrementUploadLimit();
+            }
         }
 
         const postRef = push(ref(db, 'community_posts'));
@@ -478,6 +546,11 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
         document.getElementById('post-image-url').value = '';
         fileInput.value = '';
         document.getElementById('file-name').innerText = '';
+        const previewContainer = document.getElementById('media-preview-container');
+        if (previewContainer) {
+            previewContainer.innerHTML = '';
+            previewContainer.classList.add('hidden');
+        }
         window.clearIsolatedPost();
 
         window.postVisibility = 'public';
@@ -517,7 +590,8 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
     let finalImage = null;
     if (file) {
         try { 
-            finalImage = await window.compressImage(file, true);
+            const base64Img = await window.compressImage(file, true);
+            finalImage = await window.uploadToCloudinary(base64Img);
             window.incrementUploadLimit();
         } catch(e) { 
             console.error("Compression failed", e); 
@@ -815,6 +889,7 @@ document.getElementById('save-profile-btn').addEventListener('click', async () =
     const gender = document.getElementById('profile-gender').value;
     const relationship = document.getElementById('profile-relationship').value;
     let partner = document.getElementById('profile-partner').value.trim();
+    const bio = document.getElementById('profile-bio').value.trim();
     if(!['In a relationship', 'Engaged', 'Married', 'Complicated'].includes(relationship)) partner = '';
 
     let newPicUrl = document.getElementById('profile-pic-url').value.trim();
@@ -826,8 +901,11 @@ document.getElementById('save-profile-btn').addEventListener('click', async () =
 
     let finalPic = newPicUrl;
     try {
-        if(file) finalPic = await window.compressImage(file);
-    } catch(e) { console.error("Compression failed", e); }
+        if(file) {
+            const base64Img = await window.compressImage(file);
+            finalPic = await window.uploadToCloudinary(base64Img);
+        }
+    } catch(e) { console.error("Compression/Upload failed", e); }
     
     if(!finalPic) finalPic = cache.pic || window.currentUser.photoURL || window.generateAvatar(window.currentUser.uid);
 
@@ -842,7 +920,7 @@ document.getElementById('save-profile-btn').addEventListener('click', async () =
 
     if(window.currentUser) {
         try {
-            await update(ref(db, `users/${window.currentUser.uid}`), { name: finalName, pic: finalPic, gender, relationship, partner, galleryImages });
+            await update(ref(db, `users/${window.currentUser.uid}`), { name: finalName, pic: finalPic, gender, relationship, partner, bio, galleryImages });
             try { await updateProfile(window.currentUser, { displayName: finalName, photoURL: finalPic }); } catch (e) { }
             
             document.getElementById('profile-modal').classList.add('hidden');
@@ -944,10 +1022,28 @@ onAuthStateChanged(auth, (user) => {
 
         window.updateNotifBadge();
 
+        if (window.chatInboxUnsubscribe) window.chatInboxUnsubscribe();
+        window.chatInboxUnsubscribe = onValue(ref(db, `chatInboxes/${user.uid}`), (snap) => {
+            const inbox = snap.val() || {};
+            let unreadCount = 0;
+            Object.values(inbox).forEach(item => {
+                if (item.unreadCount > 0) unreadCount++;
+            });
+            const badge = document.getElementById('chat-unread-badge');
+            if (badge) {
+                if (unreadCount > 0) {
+                    badge.innerText = unreadCount > 9 ? '9+' : unreadCount;
+                    badge.classList.remove('hidden');
+                } else {
+                    badge.classList.add('hidden');
+                }
+            }
+        });
     } else {
         document.getElementById('open-login-btn').classList.remove('hidden');
         document.getElementById('user-info').classList.add('hidden');
         document.getElementById('create-post-box').classList.add('hidden');
+        if (window.chatInboxUnsubscribe) { window.chatInboxUnsubscribe(); window.chatInboxUnsubscribe = null; }
     }
     if(!window.activeProfileUid) window.renderFeed(false);
 });
