@@ -150,7 +150,7 @@ const setupMentionSystem = () => {
         if (!suggestionBox) {
             suggestionBox = document.createElement('div');
             suggestionBox.id = 'mention-suggestions-box';
-            suggestionBox.className = 'hidden absolute z-50 bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 shadow-lg rounded-md mt-1 overflow-y-auto max-h-48';
+            suggestionBox.className = 'hidden absolute z-[120] bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 shadow-lg rounded-md mt-1 overflow-y-auto max-h-48';
             document.body.appendChild(suggestionBox);
         }
 
@@ -294,6 +294,12 @@ onValue(ref(db, '.info/connected'), (snap) => {
     }
 });
 
+onValue(ref(db, 'settings'), (snap) => {
+    if (snap.exists()) {
+        window.siteSettings = { ...window.siteSettings, ...snap.val() };
+    }
+});
+
 onValue(ref(db, 'presence'), (snap) => {
     window.onlineUsers = snap.val() || {};
     document.getElementById('online-count').innerText = snap.size || 0;
@@ -370,6 +376,7 @@ window.listenPosts = () => {
     }
 
     window.postsUnsubscribe = onValue(dbQuery, (snapshot) => {
+        if(window.checkGameTimers) window.checkGameTimers(snapshot.val());
         const newPosts = [];
         snapshot.forEach(child => {
             newPosts.push({ id: child.key, ...child.val() });
@@ -385,11 +392,13 @@ window.listenPosts = () => {
 
         window.allPosts = newPosts;
         
-        if (!window.isUserTyping) {
+        if (!window.isUserTyping && !window._bingoGlobalSpinning) {
             if (window.activeProfileUid) window.renderProfileData(false);
             else window.renderFeed(false);
+            if (window.processBingoAnimations) window.processBingoAnimations();
         }
         window.handleDeepLinks();
+        window.isLoadingHistory = false;
     });
 };
 
@@ -397,17 +406,10 @@ window.loadMorePosts = async () => {
     if (window.isLoadingHistory || !window.hasMorePosts) return;
     
     window.isLoadingHistory = true;
-    const sentinel = document.querySelector('.sentinel-loader');
-    if (sentinel) sentinel.innerHTML = '<span>Loading older posts...</span>';
     
+    // Increase limit and listen
     window.postLimit += 15;
     window.listenPosts();
-    
-    setTimeout(() => {
-        window.isLoadingHistory = false;
-        if (sentinel && window.hasMorePosts) sentinel.innerHTML = '';
-        else if (sentinel && !window.hasMorePosts) sentinel.innerHTML = '<span>No more posts to show.</span>';
-    }, 1000);
 };
 
 window.listenPosts();
@@ -422,8 +424,9 @@ window.checkUploadLimit = () => {
     const today = new Date().toLocaleDateString('en-CA');
     const userData = window.globalUsersCache[window.currentUser.uid] || {};
     const uploadsToday = userData.dailyUploads?.date === today ? userData.dailyUploads.count : 0;
-    if (uploadsToday >= 10) {
-        window.showAlert("You have reached your daily limit of 10 image uploads.");
+    const limit = window.siteSettings.imageUploadLimit ?? 10;
+    if (uploadsToday >= limit) {
+        window.showAlert(`You have reached your daily limit of ${limit} image uploads.`);
         return false;
     }
     return true;
@@ -442,8 +445,9 @@ window.checkVideoUploadLimit = () => {
     const today = new Date().toLocaleDateString('en-CA');
     const userData = window.globalUsersCache[window.currentUser.uid] || {};
     const uploadsToday = userData.dailyVideoUploads?.date === today ? userData.dailyVideoUploads.count : 0;
-    if (uploadsToday >= 3) {
-        window.showAlert("You have reached your daily limit of 3 video uploads.");
+    const limit = window.siteSettings.videoUploadLimit ?? 3;
+    if (uploadsToday >= limit) {
+        window.showAlert(`You have reached your daily limit of ${limit} video uploads.`);
         return false;
     }
     return true;
@@ -465,8 +469,9 @@ document.getElementById('post-image-file').addEventListener('change', function()
     
     if (file) {
         if (file.type.startsWith('video/')) {
-            if (file.size > 20 * 1024 * 1024) {
-                window.showAlert("Video is too large. Max size is 20MB.");
+            const sizeLimitMB = window.siteSettings.videoSizeLimitMB ?? 20;
+            if (file.size > sizeLimitMB * 1024 * 1024) {
+                window.showAlert(`Video is too large. Max size is ${sizeLimitMB}MB.`);
                 this.value = '';
                 document.getElementById('file-name').innerText = '';
                 previewContainer.classList.add('hidden');
@@ -507,8 +512,9 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
         if (isVideo && !window.checkVideoUploadLimit()) return;
         if (!isVideo && !window.checkUploadLimit()) return;
         
-        if (isVideo && file.size > 20 * 1024 * 1024) {
-            window.showAlert("Video is too large. Max size is 20MB.");
+        const sizeLimitMB = window.siteSettings.videoSizeLimitMB ?? 20;
+        if (isVideo && file.size > sizeLimitMB * 1024 * 1024) {
+            window.showAlert(`Video is too large. Max size is ${sizeLimitMB}MB.`);
             return;
         }
     }
@@ -522,11 +528,11 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
         if (file) {
             btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
             if (isVideo) {
-                finalImage = await window.uploadToCloudinary(file);
+                finalImage = await window.uploadToCloudinary(file, window.currentUser.uid);
                 window.incrementVideoUploadLimit();
             } else {
                 const base64Img = await window.compressImage(file); 
-                finalImage = await window.uploadToCloudinary(base64Img);
+                finalImage = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
                 window.incrementUploadLimit();
             }
         }
@@ -539,8 +545,10 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
             visibility: window.postVisibility || 'public' 
         });
         
-        update(ref(db, `users/${window.currentUser.uid}`), { points: increment(10) });
+        const pointsToAdd = window.siteSettings.starsPerPost ?? 10;
+        update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
         window.notifyMentions(text, postRef.key);
+        window.logActivity("posted a new update");
         
         document.getElementById('post-text').value = '';
         document.getElementById('post-image-url').value = '';
@@ -591,7 +599,7 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
     if (file) {
         try { 
             const base64Img = await window.compressImage(file, true);
-            finalImage = await window.uploadToCloudinary(base64Img);
+            finalImage = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
             window.incrementUploadLimit();
         } catch(e) { 
             console.error("Compression failed", e); 
@@ -600,6 +608,8 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
         }
     }
 
+    input.focus();
+
     await push(ref(db, `community_posts/${postId}/comments`), { 
         uid: window.currentUser.uid, 
         text: text, 
@@ -607,10 +617,11 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
         timestamp: Date.now(), 
         edited: false 
     });
-    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(1) });
+    const pointsToAdd = window.siteSettings.starsPerLike ?? 1;
+    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
     
     if(window.currentUser.uid !== postAuthorId && postAuthorId !== "undefined") {
-        update(ref(db, `users/${postAuthorId}`), { points: increment(1) });
+        update(ref(db, `users/${postAuthorId}`), { points: increment(pointsToAdd) });
         push(ref(db, `users/${postAuthorId}/notifications`), { 
             type: 'comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
         });
@@ -629,7 +640,9 @@ window.submitReply = (postId, commentId, prefix, commentAuthorId) => {
     input.value = '';
     
     push(ref(db, `community_posts/${postId}/comments/${commentId}/replies`), { uid: window.currentUser.uid, text: text, timestamp: Date.now(), edited: false });
-    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(1) });
+    const pointsToAdd = window.siteSettings.starsPerComment ?? 1;
+    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
+    window.logActivity(`commented on a post by ${commentAuthorId}`);
     
     if(window.currentUser.uid !== commentAuthorId && commentAuthorId !== "undefined") {
         push(ref(db, `users/${commentAuthorId}/notifications`), { 
@@ -639,7 +652,7 @@ window.submitReply = (postId, commentId, prefix, commentAuthorId) => {
 
     window.notifyMentions(text, postId);
     window.openRepliesList.add(commentId);
-    window.renderFeed(false); 
+    input.focus();
 };
 
 window.react = (postId, postAuthorId, type) => {
@@ -657,7 +670,8 @@ window.react = (postId, postAuthorId, type) => {
     const hasReacted = post.reactions && post.reactions[type] && post.reactions[type][window.currentUser.uid];
     if(hasReacted) {
         remove(ref(db, `community_posts/${postId}/reactions/${type}/${window.currentUser.uid}`));
-        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") update(ref(db, `users/${postAuthorId}`), { points: increment(-1) });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") update(ref(db, `users/${postAuthorId}`), { points: increment(-likePoints) });
     } else {
         if (userReactCount >= 3) {
             window.showAlert("You can only have up to 3 simultaneous reactions on a post.");
@@ -665,11 +679,15 @@ window.react = (postId, postAuthorId, type) => {
         }
         set(ref(db, `community_posts/${postId}/reactions/${type}/${window.currentUser.uid}`), true);
         if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") {
-            update(ref(db, `users/${postAuthorId}`), { points: increment(1) });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") {
+            update(ref(db, `users/${postAuthorId}`), { points: increment(likePoints) });
+        }
             push(ref(db, `users/${postAuthorId}/notifications`), { 
                 type: 'react_post', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
         }
+        window.logActivity(`reacted to a post by ${postAuthorId}`);
     }
 };
 
@@ -689,7 +707,8 @@ window.reactComment = (postId, commentId, commentAuthorId, type) => {
     const hasReacted = comment.reactions && comment.reactions[type] && comment.reactions[type][window.currentUser.uid];
     if(hasReacted) {
         remove(ref(db, `community_posts/${postId}/comments/${commentId}/reactions/${type}/${window.currentUser.uid}`));
-        if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") update(ref(db, `users/${commentAuthorId}`), { points: increment(-1) });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") update(ref(db, `users/${commentAuthorId}`), { points: increment(-likePoints) });
     } else {
         if (userReactCount >= 3) {
             window.showAlert("You can only have up to 3 simultaneous reactions on a comment.");
@@ -697,11 +716,13 @@ window.reactComment = (postId, commentId, commentAuthorId, type) => {
         }
         set(ref(db, `community_posts/${postId}/comments/${commentId}/reactions/${type}/${window.currentUser.uid}`), true);
         if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") {
-            update(ref(db, `users/${commentAuthorId}`), { points: increment(1) });
+            const likePoints = window.siteSettings.starsPerLike ?? 1;
+            update(ref(db, `users/${commentAuthorId}`), { points: increment(likePoints) });
             push(ref(db, `users/${commentAuthorId}/notifications`), { 
                 type: 'react_comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
         }
+        window.logActivity(`reacted to a comment by ${commentAuthorId}`);
     }
 };
 
@@ -722,7 +743,8 @@ window.reactReply = (postId, commentId, replyId, replyAuthorId, type) => {
     const hasReacted = reply.reactions && reply.reactions[type] && reply.reactions[type][window.currentUser.uid];
     if(hasReacted) {
         remove(ref(db, `community_posts/${postId}/comments/${commentId}/replies/${replyId}/reactions/${type}/${window.currentUser.uid}`));
-        if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") update(ref(db, `users/${replyAuthorId}`), { points: increment(-1) });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") update(ref(db, `users/${replyAuthorId}`), { points: increment(-likePoints) });
     } else {
         if (userReactCount >= 3) {
             window.showAlert("You can only have up to 3 simultaneous reactions on a reply.");
@@ -730,7 +752,8 @@ window.reactReply = (postId, commentId, replyId, replyAuthorId, type) => {
         }
         set(ref(db, `community_posts/${postId}/comments/${commentId}/replies/${replyId}/reactions/${type}/${window.currentUser.uid}`), true);
         if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") {
-            update(ref(db, `users/${replyAuthorId}`), { points: increment(1) });
+            const likePoints = window.siteSettings.starsPerLike ?? 1;
+            update(ref(db, `users/${replyAuthorId}`), { points: increment(likePoints) });
             push(ref(db, `users/${replyAuthorId}/notifications`), { 
                 type: 'react_reply', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
@@ -903,7 +926,7 @@ document.getElementById('save-profile-btn').addEventListener('click', async () =
     try {
         if(file) {
             const base64Img = await window.compressImage(file);
-            finalPic = await window.uploadToCloudinary(base64Img);
+            finalPic = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
         }
     } catch(e) { console.error("Compression/Upload failed", e); }
     
@@ -968,6 +991,10 @@ document.getElementById('forgot-pass-btn').addEventListener('click', async () =>
 document.getElementById('auth-action-btn').addEventListener('click', async () => {
     const email = document.getElementById('auth-email').value;
     const pass = document.getElementById('auth-password').value;
+    const btn = document.getElementById('auth-action-btn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = `<svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Please wait...`;
+    btn.disabled = true;
     try {
         if (window.isSignUpMode) {
             const cred = await createUserWithEmailAndPassword(auth, email, pass);
@@ -977,14 +1004,31 @@ document.getElementById('auth-action-btn').addEventListener('click', async () =>
             
             update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic });
             document.getElementById('nav-avatar').src = newPic;
-        } else await signInWithEmailAndPassword(auth, email, pass);
+            window.showAlert("Account created successfully!");
+        } else {
+            await signInWithEmailAndPassword(auth, email, pass);
+            window.showAlert("Signed in successfully!");
+        }
         document.getElementById('auth-modal').classList.add('hidden');
-    } catch (error) { showError(error.message.replace('Firebase:', '')); }
+    } catch (error) { 
+        showError(error.message.replace('Firebase:', '')); 
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
 });
 
 document.getElementById('guest-login-btn').addEventListener('click', async () => {
     const guestEmail = `guest_${window.deviceId}@hangout.local`, guestPass = window.deviceId + "_secret";
-    try { await signInWithEmailAndPassword(auth, guestEmail, guestPass); document.getElementById('auth-modal').classList.add('hidden'); } 
+    const btn = document.getElementById('guest-login-btn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = `<svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-gray-700 dark:text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Please wait...`;
+    btn.disabled = true;
+    try { 
+        await signInWithEmailAndPassword(auth, guestEmail, guestPass); 
+        document.getElementById('auth-modal').classList.add('hidden'); 
+        window.showAlert("Signed in as Guest!");
+    } 
     catch {
         try {
             const cred = await createUserWithEmailAndPassword(auth, guestEmail, guestPass);
@@ -995,18 +1039,29 @@ document.getElementById('guest-login-btn').addEventListener('click', async () =>
             update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic, isGuest: true });
             document.getElementById('nav-avatar').src = newPic;
             document.getElementById('auth-modal').classList.add('hidden');
+            window.showAlert("Guest account created!");
         } catch(e) { showError("Failed to create guest account."); }
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
     }
 });
 
 document.getElementById('logout-btn').addEventListener('click', () => { 
     stopOwnPresence(window.currentUser); 
+    window.logActivity("logged out");
     signOut(auth); 
+    window.showAlert("Logged out successfully!");
 });
 
 onAuthStateChanged(auth, (user) => {
     window.currentUser = user;
     if (user) {
+        if (!sessionStorage.getItem('session_started')) {
+            sessionStorage.setItem('session_started', 'true');
+            // Give time for globalUsersCache to populate
+            setTimeout(() => window.logActivity("logged in"), 1000);
+        }
         update(ref(db, `users/${user.uid}`), { lastSeen: serverTimestamp() });
         
         startOwnPresence(user);
