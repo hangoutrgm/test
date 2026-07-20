@@ -1,5 +1,6 @@
-import { db } from "./firebase-config.js";
+import { db, fsdb } from "./firebase-config.js";
 import { ref, update, set, push, remove, increment, get, onValue } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 // Notifications
 window.updateNotifBadge = () => {
@@ -260,9 +261,9 @@ window.renderFeed = (resetLimit = true) => {
             </div>`;
             if (window.isolatedPostUnsubscribe) window.isolatedPostUnsubscribe();
             
-            window.isolatedPostUnsubscribe = onValue(ref(db, `community_posts/${window.isolatedPostId}`), (snapshot) => {
+            window.isolatedPostUnsubscribe = onSnapshot(doc(fsdb, 'community_posts', window.isolatedPostId), (snapshot) => {
                 if (snapshot.exists()) {
-                    const post = { id: snapshot.key, ...snapshot.val() };
+                    const post = { id: snapshot.id, ...snapshot.data() };
                     
                     const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
                     if (existingIndex >= 0) {
@@ -271,7 +272,7 @@ window.renderFeed = (resetLimit = true) => {
                         window.allPosts.push(post);
                     }
 
-                    if (!window.isUserTyping) {
+                    if (!window.isUserTyping && !window._bingoGlobalSpinning) {
                         window.renderFeed(false);
                     }
                 } else {
@@ -296,6 +297,7 @@ window.renderFeed = (resetLimit = true) => {
         }
 
         window.renderPostList(feed, [singlePost], 'main', 'isolated');
+        if (window.processBingoAnimations) window.processBingoAnimations();
         return;
     }
     
@@ -306,8 +308,17 @@ window.renderFeed = (resetLimit = true) => {
     catFilters.classList.remove('hidden');
 
     const postSearchQ = (document.getElementById('post-search')?.value || '').toLowerCase();
+    // Merge global pinned posts into the display pool so old pinned posts are always available
+    const mergedMap = new Map();
+    window.allPosts.forEach(p => mergedMap.set(p.id, p));
+    if (window.currentFilter === 'All' || window.currentFilter === 'My Posts') {
+        window.globalPinnedPosts.forEach(p => mergedMap.set(p.id, p));
+    } else {
+        window.globalPinnedPosts.filter(p => p.category === window.currentFilter).forEach(p => mergedMap.set(p.id, p));
+    }
+    const mergedPosts = Array.from(mergedMap.values());
     
-    let displayPosts = window.allPosts.filter(p => {
+    let displayPosts = mergedPosts.filter(p => {
         if (window.currentFilter === "My Posts" && (!window.currentUser || p.authorId !== window.currentUser.uid)) return false;
         if (window.currentFilter !== "All" && window.currentFilter !== "My Posts" && p.category !== window.currentFilter) return false;
         
@@ -407,6 +418,7 @@ window.renderFeed = (resetLimit = true) => {
     }
     window.scrollTo(0, currentScroll);
     requestAnimationFrame(() => feed.style.minHeight = '');
+    if (window.processBingoAnimations) window.processBingoAnimations();
 };
 
 window.renderProfileData = (resetLimit = true) => {
@@ -502,8 +514,15 @@ window.renderProfileData = (resetLimit = true) => {
         </div>` : ''}
     `;
 
+    const profPostsFilter = document.getElementById('profile-posts-filter')?.value || 'All';
     const pFeed = document.getElementById('profile-feed');
-    let pPosts = window.allPosts.filter(p => {
+    // Merge profile pinned posts into the display pool
+    const mergedMap = new Map();
+    window.allPosts.forEach(p => mergedMap.set(p.id, p));
+    window.profilePinnedPosts.filter(p => p.authorId === window.activeProfileUid).forEach(p => mergedMap.set(p.id, p));
+    const mergedPosts = Array.from(mergedMap.values());
+    
+    let pPosts = mergedPosts.filter(p => {
         if (p.authorId !== window.activeProfileUid) return false;
         
         // ==========================================
@@ -592,6 +611,7 @@ window.renderProfileData = (resetLimit = true) => {
     }
     window.scrollTo(0, currentScroll);
     requestAnimationFrame(() => pFeed.style.minHeight = '');
+    if (window.processBingoAnimations) window.processBingoAnimations();
 };
 
 window.generatePostHTML = function(post, prefix, filterContext) {
@@ -1133,7 +1153,11 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 if (isHost) hostHint = `<div class="text-xs text-yellow-600 dark:text-yellow-400 font-bold mt-1 bg-yellow-50 dark:bg-yellow-900/20 px-3 py-1 rounded-full">🔑 Answer: ${post.gameFlagName}</div>`;
                 answerHint = `<p class="text-xs text-gray-400 mt-1">Type the country name, e.g. "France"</p>`;
             } else if (post.gameType === 'math') {
-                displayContent = `<div class="text-3xl font-bold font-mono text-blue-700 dark:text-blue-300 mb-2">${post.gameMathQuestion} = ?</div>`;
+                // Only append "= ?" if the question doesn't already contain it (algebra questions include it)
+                const mathDisplay = post.gameMathQuestion.includes('=') 
+                    ? post.gameMathQuestion 
+                    : `${post.gameMathQuestion} = ?`;
+                displayContent = `<div class="text-3xl font-bold font-mono text-blue-700 dark:text-blue-300 mb-2">${mathDisplay}</div>`;
                 gameTitle = 'Solve the math problem!';
                 if (isHost) hostHint = `<div class="text-xs text-yellow-600 dark:text-yellow-400 font-bold mt-1 bg-yellow-50 dark:bg-yellow-900/20 px-3 py-1 rounded-full">🔑 Answer: ${post.gameMathAnswer}</div>`;
                 answerHint = `<p class="text-xs text-gray-400 mt-1">Type the number</p>`;
@@ -1275,6 +1299,82 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                         ${outcomeHtml2}
                     </div>`;
             }
+        } else if (post.gameType === 'spin_names') {
+            const isHost = window.currentUser && window.currentUser.uid === post.authorId;
+            const joinedArray = post.spinNamesJoined ? Object.values(post.spinNamesJoined) : [];
+            const hasJoined = window.currentUser ? joinedArray.some(u => u.uid === window.currentUser.uid) : false;
+            const entryCount = joinedArray.length;
+            
+            const animatingItem = (post.spinNamesLastSpin && Date.now() - post.spinNamesLastSpin.startTime < 4000) ? post.spinNamesLastSpin.item : null;
+            const winnersList = Array.isArray(post.spinNamesWinners) ? post.spinNamesWinners : [];
+            
+            if (post.spinNamesPhase === 'submission') {
+                gameHtml = `
+                    <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-slate-800 dark:to-slate-800 rounded-xl border-2 border-blue-200 dark:border-blue-900/50 flex flex-col items-center">
+                        <h4 class="font-black text-blue-800 dark:text-blue-200 text-lg mb-1">🎡 Spin the Names!</h4>
+                        <p class="text-xs text-gray-600 dark:text-gray-300 mb-2">Join the draw for a chance to win.</p>
+                        <p class="text-xs text-gray-400 mb-2"><i class="fa-solid fa-users mr-1"></i>${entryCount} players joined</p>
+                        ${hasJoined 
+                            ? `<div class="text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 px-3 py-1 rounded-full font-bold mb-2"><i class="fa-solid fa-check mr-1"></i>You joined!</div>`
+                            : (!isHost ? `<button onclick="window.joinSpinNames('${post.id}')" class="mt-2 bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-full shadow transition"><i class="fa-solid fa-right-to-bracket mr-2"></i>Join Spin</button>` : `<div class="text-xs text-gray-400 italic">You are the host</div>`)
+                        }
+                        ${isHost ? `<button onclick="window.closeSpinNames('${post.id}')" class="mt-3 bg-indigo-500 hover:bg-indigo-400 text-white font-bold py-2 px-6 rounded-full shadow transition text-xs"><i class="fa-solid fa-play mr-2"></i>Close Submissions & Start Draw</button>` : ''}
+                    </div>`;
+            } else if (post.spinNamesPhase === 'drawing' || (post.spinNamesPhase === 'ended' && animatingItem !== null)) {
+                const isSpinning = animatingItem !== null;
+                const canvasClass = isSpinning ? "opacity-100 scale-100" : "opacity-80 scale-95";
+                
+                // Show current target for this spin (which spin is this?)
+                const currentSpinNum = winnersList.length + (isSpinning ? 1 : 1);
+                
+                let winnersHtml = winnersList.length > 0 
+                    ? winnersList.map((w, idx) => `<div class="text-[10px] bg-white dark:bg-slate-700 rounded px-2 py-1 shadow-sm mb-1">Spin #${w.target}: <strong>${w.name}</strong> - ${w.prize}</div>`).join('')
+                    : `<span class="text-xs text-gray-400">None yet</span>`;
+                    
+                gameHtml = `
+                    <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-slate-800 dark:to-slate-800 rounded-xl border-2 border-indigo-300 dark:border-indigo-900/50 flex flex-col items-center overflow-hidden">
+                        <h4 class="font-black text-indigo-800 dark:text-indigo-200 text-base mb-1">🎡 Draw in Progress!</h4>
+                        <p class="text-xs text-gray-500 mb-2"><i class="fa-solid fa-users mr-1"></i>${entryCount} players in wheel</p>
+                        
+                        <div class="relative my-3 transform transition-all duration-300 ${canvasClass}">
+                            <div class="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1 z-10 text-red-500 text-2xl leading-none drop-shadow-md">▼</div>
+                            <canvas id="spin-names-wheel-${post.id}" width="200" height="200" class="rounded-full shadow-lg border-4 border-indigo-400 bg-white dark:bg-slate-700"></canvas>
+                        </div>
+                        
+                        <div class="w-full mb-3 text-center">
+                            <p class="text-xs font-bold text-gray-600 dark:text-gray-300 mb-1.5">Winners so far:</p>
+                            <div class="flex flex-col items-center gap-1">${winnersHtml}</div>
+                        </div>
+                        
+                        ${isHost ? `<div class="flex gap-2 w-full"><button id="spin-names-btn-${post.id}" onclick="window.startSpinNamesWheel('${post.id}')" ${isSpinning ? 'disabled' : ''} class="flex-1 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-400 hover:to-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2 rounded-full shadow transition"><i class="fa-solid fa-play mr-2"></i>SPIN!</button></div>` : ''}
+                    </div>`;
+                
+                if (!window._bingoRenderQueue) window._bingoRenderQueue = [];
+                window._bingoRenderQueue.push({ id: post.id, postData: post }); // Reuse bingo queue to trigger canvas drawing
+                
+            } else if (post.spinNamesPhase === 'ended' || post.gameStatus === 'ended') {
+                let winnersHtml = winnersList.length > 0 
+                    ? winnersList.map((w, idx) => `<div class="bg-indigo-100 dark:bg-indigo-900/30 text-indigo-800 dark:text-indigo-300 text-xs font-bold px-3 py-2 rounded mb-1 shadow-sm"><i class="fa-solid fa-trophy mr-1 text-yellow-500"></i>${w.name} won ${w.prize}! (Spin #${w.target})</div>`).join('')
+                    : `<div class="bg-gray-100 dark:bg-gray-800 text-gray-500 text-xs font-bold px-3 py-2 rounded">No winners.</div>`;
+                    
+                gameHtml = `
+                    <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center text-center opacity-90">
+                        <h4 class="font-black text-gray-700 dark:text-gray-300 text-base mb-2">🎡 Spin the Names Ended</h4>
+                        <div class="w-full mb-2 flex flex-col items-center">
+                            ${winnersHtml}
+                        </div>
+                    </div>`;
+            }
+        } else if (post.gameType === 'ncl') {
+            const winnerName = post.gameWinner ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone') : 'Someone';
+            gameHtml = `
+                <div class="mt-3 mb-2 p-4 bg-gradient-to-r from-pink-100 to-rose-100 dark:from-pink-900/40 dark:to-rose-900/40 rounded-xl border-2 border-pink-300 dark:border-pink-700/50 flex flex-col items-center text-center shadow-sm">
+                    <div class="text-3xl mb-2">🎁</div>
+                    <h4 class="font-black text-pink-800 dark:text-pink-300 text-lg mb-1">ncl @${winnerName}</h4>
+                    <div class="mt-2 bg-white dark:bg-slate-800/80 px-4 py-2 rounded-lg font-bold text-pink-600 dark:text-pink-400 shadow-inner text-sm">
+                        ${post.gamePrize}
+                    </div>
+                </div>`;
         }
     }
 
@@ -1447,7 +1547,7 @@ window.renderMembers = (resetLimit = true) => {
 };
 
 window.showReactors = (postId, commentId = null) => {
-    const post = window.allPosts.find(p => p.id === postId);
+    const post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId);
     if (!post) return;
     const target = commentId ? post.comments?.[commentId] : post;
     if (!target) return;
@@ -1527,4 +1627,354 @@ window.promptCustomReaction = (postId, authorId, commentId = null, commentAuthor
     
     modal.classList.remove('hidden');
     input.focus();
+};
+
+window.openRankingModal = () => {
+    document.getElementById('ranking-modal').classList.remove('hidden');
+    // Clear caches so data is fresh on every open
+    window._earningsCache = null;
+    window._hostedGamesCache = null;
+    window.renderRankings(true);
+};
+
+window.renderRankings = async (resetLimit = true) => {
+    const list = document.getElementById('ranking-list');
+    const loader = document.getElementById('ranking-loader');
+    
+    if(resetLimit) window.rankingRenderLimit = 20;
+
+    const currentScroll = list.scrollTop;
+    list.style.minHeight = list.clientHeight + 'px';
+    
+    if(resetLimit) list.innerHTML = '';
+    
+    if (window.currentRankingFilter === "Earnings") {
+        if (!window.currentUser) {
+            list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">Please log in to view your earnings.</p>`;
+            return;
+        }
+        
+        // Use a cached version to prevent refetching during lazy loading if we already have it
+        if (resetLimit || !window._earningsCache) {
+            if(resetLimit) list.innerHTML = '';
+            loader.classList.remove('hidden');
+            try {
+                const snap = await get(ref(db, `users/${window.currentUser.uid}/earnings`));
+                loader.classList.add('hidden');
+                
+                if (!snap.exists()) {
+                    list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">You have no earnings yet.</p>`;
+                    window._earningsCache = [];
+                    return;
+                }
+                
+                let earningsArray = [];
+                snap.forEach(child => {
+                    earningsArray.push({ id: child.key, ...child.val() });
+                });
+                
+                earningsArray.sort((a, b) => b.timestamp - a.timestamp);
+                window._earningsCache = earningsArray;
+            } catch (error) {
+                console.error(error);
+                loader.classList.add('hidden');
+                list.innerHTML = `<p class="text-center text-red-500 text-sm py-4">Error loading earnings.</p>`;
+                return;
+            }
+        }
+        
+        if (resetLimit) list.innerHTML = '';
+        const earningsArray = window._earningsCache;
+
+        // Build totals summary when showing from the beginning
+        if (resetLimit && earningsArray.length > 0) {
+            const totalLb = earningsArray.reduce((sum, e) => sum + (e.lbPoints || 0), 0);
+            const totalPrize = earningsArray.reduce((sum, e) => {
+                const num = parseFloat((e.prize || '').toString().replace(/[^0-9.]/g, ''));
+                return sum + (isNaN(num) ? 0 : num);
+            }, 0);
+
+            const summaryEl = document.createElement('div');
+            summaryEl.className = 'flex items-center justify-around p-3 bg-gradient-to-r from-yellow-50 to-amber-50 dark:from-yellow-900/20 dark:to-amber-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800/50 mb-3';
+            summaryEl.innerHTML = `
+                <div class="text-center">
+                    <div class="text-xl font-black text-yellow-600 dark:text-yellow-400">🏆 ${totalLb}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total LB Points</div>
+                </div>
+                <div class="w-px h-10 bg-yellow-200 dark:bg-yellow-800/50"></div>
+                <div class="text-center">
+                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? totalPrize : earningsArray.filter(e => e.prize).length + ' reward(s)'}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total Prize Value</div>
+                </div>
+                <div class="w-px h-10 bg-yellow-200 dark:bg-yellow-800/50"></div>
+                <div class="text-center">
+                    <div class="text-xl font-black text-blue-600 dark:text-blue-400">${earningsArray.length}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total Wins</div>
+                </div>
+            `;
+            list.appendChild(summaryEl);
+        }
+
+        const toRender = earningsArray.slice(resetLimit ? 0 : window.rankingRenderLimit - 20, window.rankingRenderLimit);
+        const fragment = document.createDocumentFragment();
+        
+        toRender.forEach(e => {
+            const el = document.createElement('div');
+            el.className = `flex flex-col p-3 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2`;
+            
+            const date = new Date(e.timestamp).toLocaleDateString();
+            const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold mr-1">🎁 ${e.prize}</span>` : '';
+            const lbStr = e.lbPoints ? `<span class="bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400 px-2 py-0.5 rounded text-xs font-bold">🏆 +${e.lbPoints}</span>` : '';
+            
+            el.innerHTML = `
+                <div class="flex justify-between items-start mb-1">
+                    <h4 class="font-bold text-sm text-gray-800 dark:text-gray-200 leading-tight">
+                        ${e.title}
+                    </h4>
+                    <span class="text-[10px] text-gray-400 shrink-0 ml-2">${date}</span>
+                </div>
+                <div class="flex items-center mb-1">
+                    ${prizeStr}${lbStr}
+                </div>
+                ${e.postId ? `<button onclick="window.goToPost('${e.postId}'); document.getElementById('ranking-modal').classList.add('hidden');" class="text-[10px] text-blue-500 hover:underline mt-1 self-start">View Game</button>` : ''}
+            `;
+            fragment.appendChild(el);
+        });
+        
+        if (window.rankingRenderLimit < earningsArray.length) {
+            const sentinel = document.createElement('div');
+            sentinel.className = 'h-10 w-full flex items-center justify-center text-gray-400 text-xs py-2';
+            sentinel.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-lg"></i>';
+            fragment.appendChild(sentinel);
+            list.appendChild(fragment);
+            
+            if(window.rankingObserver) window.rankingObserver.disconnect();
+            window.rankingObserver = new IntersectionObserver((entries) => {
+                if(entries[0].isIntersecting) {
+                    window.rankingRenderLimit += 20;
+                    // Remove old sentinel
+                    const s = list.querySelector('.fa-spinner')?.closest('div');
+                    if (s) s.remove();
+                    window.renderRankings(false);
+                }
+            }, { rootMargin: "200px" });
+            window.rankingObserver.observe(sentinel);
+        } else {
+            list.appendChild(fragment);
+        }
+
+    } else if (window.currentRankingFilter === "Host Log") {
+        if (!window.currentUser) {
+            list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">Please log in to view your host log.</p>`;
+            return;
+        }
+
+        if (resetLimit || !window._hostedGamesCache) {
+            if (resetLimit) list.innerHTML = '';
+            loader.classList.remove('hidden');
+            try {
+                const snap = await get(ref(db, `users/${window.currentUser.uid}/hostedGames`));
+                loader.classList.add('hidden');
+
+                if (!snap.exists()) {
+                    list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">You have no hosted games yet.</p>`;
+                    window._hostedGamesCache = [];
+                    return;
+                }
+
+                let hostedArray = [];
+                snap.forEach(child => {
+                    hostedArray.push({ id: child.key, ...child.val() });
+                });
+                hostedArray.sort((a, b) => b.timestamp - a.timestamp);
+                window._hostedGamesCache = hostedArray;
+            } catch (error) {
+                console.error(error);
+                loader.classList.add('hidden');
+                list.innerHTML = `<p class="text-center text-red-500 text-sm py-4">Error loading host log.</p>`;
+                return;
+            }
+        }
+
+        if (resetLimit) list.innerHTML = '';
+        const hostedArray = window._hostedGamesCache;
+
+        // Summary banner
+        if (resetLimit && hostedArray.length > 0) {
+            const totalPrize = hostedArray.reduce((sum, e) => {
+                const num = parseFloat((e.prize || '').toString().replace(/[^0-9.]/g, ''));
+                return sum + (isNaN(num) ? 0 : num);
+            }, 0);
+            const pendingCount = hostedArray.filter(e => e.paymentStatus !== 'paid').length;
+
+            const summaryEl = document.createElement('div');
+            summaryEl.className = 'flex items-center justify-around p-3 bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 rounded-xl border border-indigo-200 dark:border-indigo-800/50 mb-3';
+            summaryEl.innerHTML = `
+                <div class="text-center">
+                    <div class="text-xl font-black text-indigo-600 dark:text-indigo-400">🎮 ${hostedArray.length}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Games Hosted</div>
+                </div>
+                <div class="w-px h-10 bg-indigo-200 dark:bg-indigo-800/50"></div>
+                <div class="text-center">
+                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? totalPrize : hostedArray.filter(e => e.prize).length + ' prize(s)'}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total Prize Given</div>
+                </div>
+                <div class="w-px h-10 bg-indigo-200 dark:bg-indigo-800/50"></div>
+                <div class="text-center">
+                    <div class="text-xl font-black text-orange-500 dark:text-orange-400">⏳ ${pendingCount}</div>
+                    <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Pending</div>
+                </div>
+            `;
+            list.appendChild(summaryEl);
+        }
+
+        const toRender = hostedArray.slice(resetLimit ? 0 : window.rankingRenderLimit - 20, window.rankingRenderLimit);
+        const fragment = document.createDocumentFragment();
+
+        toRender.forEach(e => {
+            const el = document.createElement('div');
+            el.className = 'flex flex-col p-3 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2';
+
+            const date = new Date(e.timestamp).toLocaleDateString();
+            const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold">🎁 ${e.prize}</span>` : '';
+            const isPaid = e.paymentStatus === 'paid';
+            const payBtn = `<button
+                id="pay-btn-${e.id}"
+                onclick="window.markHostedGamePaid('${e.id}', this)"
+                class="text-[10px] font-bold px-2 py-0.5 rounded ml-auto shrink-0 ${isPaid ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 cursor-default' : 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400 hover:bg-orange-200 dark:hover:bg-orange-800/50 transition cursor-pointer'}"
+                ${isPaid ? 'disabled' : ''}>
+                ${isPaid ? '✅ Paid' : '⏳ Pending'}
+            </button>`;
+
+            el.innerHTML = `
+                <div class="flex justify-between items-start mb-1">
+                    <h4 class="font-bold text-sm text-gray-800 dark:text-gray-200 leading-tight truncate pr-2">${e.title}</h4>
+                    <span class="text-[10px] text-gray-400 shrink-0">${date}</span>
+                </div>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5">
+                    🏆 Winner: <span class="font-semibold text-gray-700 dark:text-gray-300">${e.winnerName || 'Unknown'}</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    ${prizeStr}
+                    ${payBtn}
+                </div>
+                ${e.postId ? `<button onclick="window.goToPost('${e.postId}'); document.getElementById('ranking-modal').classList.add('hidden');" class="text-[10px] text-blue-500 hover:underline mt-1 self-start">View Game</button>` : ''}
+            `;
+            fragment.appendChild(el);
+        });
+
+        if (window.rankingRenderLimit < hostedArray.length) {
+            const sentinel = document.createElement('div');
+            sentinel.className = 'h-10 w-full flex items-center justify-center text-gray-400 text-xs py-2';
+            sentinel.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-lg"></i>';
+            fragment.appendChild(sentinel);
+            list.appendChild(fragment);
+
+            if (window.rankingObserver) window.rankingObserver.disconnect();
+            window.rankingObserver = new IntersectionObserver((entries) => {
+                if (entries[0].isIntersecting) {
+                    window.rankingRenderLimit += 20;
+                    const s = list.querySelector('.fa-spinner')?.closest('div');
+                    if (s) s.remove();
+                    window.renderRankings(false);
+                }
+            }, { rootMargin: "200px" });
+            window.rankingObserver.observe(sentinel);
+        } else {
+            list.appendChild(fragment);
+        }
+
+    } else {
+        // Leaderboards or Stars
+        let usersArray = Object.keys(window.globalUsersCache).map(uid => ({uid, ...window.globalUsersCache[uid]})).filter(u => u.name);
+        
+        if (window.currentRankingFilter === "Leaderboards") {
+            usersArray.sort((a, b) => (b.lbPoints || 0) - (a.lbPoints || 0));
+        } else if (window.currentRankingFilter === "Stars") {
+            usersArray.sort((a, b) => (b.points || 0) - (a.points || 0));
+        }
+        
+        if(usersArray.length === 0) {
+            list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">No users found.</p>`;
+            return;
+        }
+
+        const toRender = usersArray.slice(resetLimit ? 0 : window.rankingRenderLimit - 20, window.rankingRenderLimit);
+        const fragment = document.createDocumentFragment();
+
+        toRender.forEach((u, idx) => {
+            const rank = (resetLimit ? 0 : window.rankingRenderLimit - 20) + idx + 1;
+            let rankHtml = `<div class="w-6 text-center font-bold text-gray-400 dark:text-gray-500 text-xs">#${rank}</div>`;
+            if (rank === 1) rankHtml = `<div class="w-6 text-center text-yellow-500 text-lg"><i class="fa-solid fa-medal"></i></div>`;
+            else if (rank === 2) rankHtml = `<div class="w-6 text-center text-gray-400 text-lg"><i class="fa-solid fa-medal"></i></div>`;
+            else if (rank === 3) rankHtml = `<div class="w-6 text-center text-amber-600 text-lg"><i class="fa-solid fa-medal"></i></div>`;
+
+            const el = document.createElement('div');
+            el.className = `flex items-center justify-between p-2 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2`;
+            
+            const highlightValue = window.currentRankingFilter === "Leaderboards" 
+                ? `<span class="text-yellow-600 dark:text-yellow-500 font-bold">🏆 ${u.lbPoints || 0}</span>` 
+                : `<span class="text-yellow-600 dark:text-yellow-500 font-bold">⭐ ${u.points || 0}</span>`;
+            
+            el.innerHTML = `
+                <div class="flex items-center space-x-3 overflow-hidden">
+                    ${rankHtml}
+                    <div class="relative shrink-0">
+                        <img src="${u.pic}" loading="lazy" class="w-9 h-9 rounded-full object-cover border border-gray-200 dark:border-slate-600 cursor-pointer hover:opacity-80" onclick="window.openProfile('${u.uid}'); document.getElementById('ranking-modal').classList.add('hidden');">
+                    </div>
+                    <div class="leading-tight truncate pr-2">
+                        <div class="flex items-center">
+                            <h3 class="font-bold text-sm text-gray-900 dark:text-white truncate cursor-pointer hover:underline" onclick="window.openProfile('${u.uid}'); document.getElementById('ranking-modal').classList.add('hidden');">${u.name}</h3>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center shrink-0 pr-1 text-sm">${highlightValue}</div>
+            `;
+            fragment.appendChild(el);
+        });
+
+        if (window.rankingRenderLimit < usersArray.length) {
+            const sentinel = document.createElement('div');
+            sentinel.className = 'h-10 w-full flex items-center justify-center text-gray-400 text-xs py-2';
+            sentinel.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-lg"></i>';
+            fragment.appendChild(sentinel);
+            list.appendChild(fragment);
+            
+            if(window.rankingObserver) window.rankingObserver.disconnect();
+            window.rankingObserver = new IntersectionObserver((entries) => {
+                if(entries[0].isIntersecting) {
+                    window.rankingRenderLimit += 20;
+                    const s = list.querySelector('.fa-spinner')?.closest('div');
+                    if (s) s.remove();
+                    window.renderRankings(false);
+                }
+            }, { rootMargin: "200px" });
+            window.rankingObserver.observe(sentinel);
+        } else {
+            list.appendChild(fragment);
+        }
+    }
+    
+    if(resetLimit) list.scrollTop = currentScroll;
+    requestAnimationFrame(() => list.style.minHeight = '');
+};
+
+window.markHostedGamePaid = async (entryId, btn) => {
+    if (!window.currentUser) return;
+    try {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+        await update(ref(db, `users/${window.currentUser.uid}/hostedGames/${entryId}`), { paymentStatus: 'paid' });
+        // Update local cache so re-renders stay consistent
+        if (window._hostedGamesCache) {
+            const entry = window._hostedGamesCache.find(e => e.id === entryId);
+            if (entry) entry.paymentStatus = 'paid';
+        }
+        btn.textContent = '✅ Paid';
+        btn.className = btn.className.replace(/bg-orange-\S+ text-orange-\S+/g, 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 cursor-default');
+    } catch(err) {
+        console.error('Error marking paid:', err);
+        btn.disabled = false;
+        btn.textContent = '⏳ Pending';
+    }
 };
