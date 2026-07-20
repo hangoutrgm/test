@@ -1,9 +1,9 @@
 // main.js
 import { app, auth, db, fsdb } from "./firebase-config.js";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
-import { ref, push, onValue, get, set, update, remove, increment, onDisconnect } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
-import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
-import "./globals.js";
+import { ref, push, onValue, get, set, update, remove, increment, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter, deleteField } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+
 import "./helpers.js";
 import "./renderers.js";
 
@@ -679,7 +679,7 @@ document.getElementById('submit-post-btn').addEventListener('click', async () =>
         const newPostRef = await addDoc(collection(fsdb, 'community_posts'), {
             authorId: window.currentUser.uid, text: text, image: finalImage,
             category: document.getElementById('post-category').value,
-            timestamp: fsServerTimestamp(), pinned: false, edited: false, locked: false, reactions: {},
+            timestamp: Date.now(), pinned: false, edited: false, locked: false, reactions: {},
             visibility: window.postVisibility || 'public' 
         });
         
@@ -772,7 +772,7 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
     if(btn) { btn.innerText = "Send"; btn.disabled = false; }
 };
 
-window.submitReply = (postId, commentId, prefix, commentAuthorId) => {
+window.submitReply = async (postId, commentId, prefix, commentAuthorId) => {
     if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
     if (window.checkBan()) return;
     const input = document.getElementById(`reply-input-${prefix}-${commentId}`); 

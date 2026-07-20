@@ -706,11 +706,12 @@ window.checkGameTimers = (postsData) => {
             } else {
                 // For quick_challenge, challenge, guess_emoji, bring_me_emoji
                 if (p.gameEndTime && p.gameStatus === 'active' && Date.now() > p.gameEndTime) {
-                updateDoc(doc(fsdb, 'community_posts', key), {
-                    gameStatus: 'ended',
-                    gameWinner: "none",
-                    locked: true
-                }).catch(e => console.error("Error failing game on timeout:", e));
+                    updateDoc(doc(fsdb, 'community_posts', key), {
+                        gameStatus: 'ended',
+                        gameWinner: "none",
+                        locked: true
+                    }).catch(e => console.error("Error failing game on timeout:", e));
+                }
             }
         }
     }
@@ -1126,7 +1127,7 @@ window.spinBingoWheel = async (postId) => {
         }
         const hostLbReward = window.siteSettings.gameHostLbReward ?? 0;
         if (hostLbReward > 0 && post.authorId) {
-            updateDoc(doc(fsdb, 'users', post.authorId), { lbPoints: increment(hostLbReward) });
+            update(ref(db, `users/${post.authorId}`), { lbPoints: increment(hostLbReward) });
         }
     }
 
@@ -1345,7 +1346,7 @@ window.drawSpinNamesItem = async (postId) => {
         // Award LB points if any (split from post gameLbPoints across winners, or just award per win)
         const lbPoints = post.gameLbPoints !== undefined ? post.gameLbPoints : 0;
         if (lbPoints > 0) {
-            updateDoc(doc(fsdb, 'users', winner.uid), { lbPoints: increment(lbPoints) });
+            update(ref(db, `users/${winner.uid}`), { lbPoints: increment(lbPoints) });
         }
         window.logEarnings(winner.uid, postId, `Spin the Names (#${currentSpinNumber})`, matchingPrize.prize, lbPoints);
         if (post.authorId) {
@@ -1361,7 +1362,7 @@ window.drawSpinNamesItem = async (postId) => {
             updates.locked = true;
             const hostLbReward = window.siteSettings?.gameHostLbReward ?? 0;
             if (hostLbReward > 0 && post.authorId) {
-                updateDoc(doc(fsdb, 'users', post.authorId), { lbPoints: increment(hostLbReward) });
+                update(ref(db, `users/${post.authorId}`), { lbPoints: increment(hostLbReward) });
             }
         }
     }

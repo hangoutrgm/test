@@ -357,8 +357,10 @@ window.renderFeed = (resetLimit = true) => {
     displayPosts.sort((a, b) => { 
         const pinA = window.isPostPinned(a, window.currentFilter);
         const pinB = window.isPostPinned(b, window.currentFilter);
-        if (pinA !== pinB) return pinA ? -1 : 1; 
-        return (b.timestamp || 0) - (a.timestamp || 0); 
+        if (pinA !== pinB) return pinA ? -1 : 1;
+        const tsA = a.timestamp?.toMillis ? a.timestamp.toMillis() : (a.timestamp || 0);
+        const tsB = b.timestamp?.toMillis ? b.timestamp.toMillis() : (b.timestamp || 0);
+        return tsB - tsA;
     });
 
     const currentScroll = window.scrollY;
@@ -552,8 +554,10 @@ window.renderProfileData = (resetLimit = true) => {
     pPosts.sort((a, b) => { 
         const pinA = window.isPostPinned(a, 'profile');
         const pinB = window.isPostPinned(b, 'profile');
-        if (pinA !== pinB) return pinA ? -1 : 1; 
-        return (b.timestamp || 0) - (a.timestamp || 0); 
+        if (pinA !== pinB) return pinA ? -1 : 1;
+        const tsA = a.timestamp?.toMillis ? a.timestamp.toMillis() : (a.timestamp || 0);
+        const tsB = b.timestamp?.toMillis ? b.timestamp.toMillis() : (b.timestamp || 0);
+        return tsB - tsA;
     });
 
     const currentScroll = window.scrollY;
