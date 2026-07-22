@@ -635,7 +635,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
     
     let timeStr = 'Just now';
     if (post.timestamp) {
-        const d = new Date(post.timestamp);
+        const ts = post.timestamp?.toMillis ? post.timestamp.toMillis() : post.timestamp;
+        const d = new Date(ts);
         timeStr = d.toLocaleDateString([], {month:'short', day:'numeric'}) + ' at ' + d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
     }
 
@@ -1275,7 +1276,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                             <div class="flex flex-wrap justify-center gap-1">${calledChipsHtml}</div>
                         </div>
                         
-                        ${isHost ? `<div class="flex gap-2 w-full"><button id="bingo-spin-btn-${post.id}" onclick="window.spinBingoWheel('${post.id}')" ${isSpinning ? 'disabled' : ''} class="flex-1 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2 rounded-full shadow transition"><i class="fa-solid fa-play mr-2"></i>SPIN!</button><button onclick="window.endBingoGame('${post.id}')" class="bg-red-500 hover:bg-red-400 text-white font-bold px-3 rounded-full transition text-xs" title="End Game (No Winner)"><i class="fa-solid fa-stop"></i></button></div>` : ''}
+                        ${isHost ? `<div class="flex gap-2 w-full"><button id="bingo-spin-btn-${post.id}" onclick="window.spinBingoWheel('${post.id}')" ${isSpinning ? 'disabled' : ''} class="flex-1 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2 rounded-full shadow transition"><i class="fa-solid fa-play mr-2"></i>SPIN!</button><button onclick="window.resetBingoGame('${post.id}')" class="bg-red-500 hover:bg-red-400 text-white font-bold px-3 rounded-full transition text-xs" title="End Game (No Winner)"><i class="fa-solid fa-stop"></i></button></div>` : ''}
                     </div>`;
                 
                 // Track this post for post-render animation setup
@@ -1305,7 +1306,9 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             }
         } else if (post.gameType === 'spin_names') {
             const isHost = window.currentUser && window.currentUser.uid === post.authorId;
-            const joinedArray = post.spinNamesJoined ? Object.values(post.spinNamesJoined) : [];
+            const joinedArray = post.spinNamesJoined 
+                ? Object.entries(post.spinNamesJoined).map(([uid, data]) => ({ ...data, uid: data.uid || uid }))
+                : [];
             const hasJoined = window.currentUser ? joinedArray.some(u => u.uid === window.currentUser.uid) : false;
             const entryCount = joinedArray.length;
             
@@ -1331,8 +1334,16 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 // Show current target for this spin (which spin is this?)
                 const currentSpinNum = winnersList.length + (isSpinning ? 1 : 1);
                 
-                let winnersHtml = winnersList.length > 0 
-                    ? winnersList.map((w, idx) => `<div class="text-[10px] bg-white dark:bg-slate-700 rounded px-2 py-1 shadow-sm mb-1">Spin #${w.target}: <strong>${w.name}</strong> - ${w.prize}</div>`).join('')
+                let displayWinners = winnersList;
+                if (isSpinning && winnersList.length > 0) {
+                    const lastWinner = winnersList[winnersList.length - 1];
+                    if (lastWinner.name === animatingItem) {
+                        displayWinners = winnersList.slice(0, -1);
+                    }
+                }
+                
+                let winnersHtml = displayWinners.length > 0 
+                    ? displayWinners.map((w, idx) => `<div class="text-[10px] bg-white dark:bg-slate-700 rounded px-2 py-1 shadow-sm mb-1">Spin #${w.target}: <strong>${w.name}</strong> - ${w.prize}</div>`).join('')
                     : `<span class="text-xs text-gray-400">None yet</span>`;
                     
                 gameHtml = `
@@ -1350,7 +1361,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                             <div class="flex flex-col items-center gap-1">${winnersHtml}</div>
                         </div>
                         
-                        ${isHost ? `<div class="flex gap-2 w-full"><button id="spin-names-btn-${post.id}" onclick="window.startSpinNamesWheel('${post.id}')" ${isSpinning ? 'disabled' : ''} class="flex-1 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-400 hover:to-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2 rounded-full shadow transition"><i class="fa-solid fa-play mr-2"></i>SPIN!</button></div>` : ''}
+                        ${isHost ? `<div class="flex gap-2 w-full"><button id="spin-names-btn-${post.id}" onclick="window.drawSpinNamesItem('${post.id}')" ${isSpinning ? 'disabled' : ''} class="flex-1 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-400 hover:to-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2 rounded-full shadow transition"><i class="fa-solid fa-play mr-2"></i>SPIN!</button></div>` : ''}
                     </div>`;
                 
                 if (!window._bingoRenderQueue) window._bingoRenderQueue = [];
@@ -1726,7 +1737,8 @@ window.renderRankings = async (resetLimit = true) => {
             const el = document.createElement('div');
             el.className = `flex flex-col p-3 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2`;
             
-            const date = new Date(e.timestamp).toLocaleDateString();
+            const ts = e.timestamp?.toMillis ? e.timestamp.toMillis() : e.timestamp;
+            const date = new Date(ts).toLocaleDateString();
             const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold mr-1">🎁 ${e.prize}</span>` : '';
             const lbStr = e.lbPoints ? `<span class="bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400 px-2 py-0.5 rounded text-xs font-bold">🏆 +${e.lbPoints}</span>` : '';
             
@@ -1839,7 +1851,8 @@ window.renderRankings = async (resetLimit = true) => {
             const el = document.createElement('div');
             el.className = 'flex flex-col p-3 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2';
 
-            const date = new Date(e.timestamp).toLocaleDateString();
+            const ts = e.timestamp?.toMillis ? e.timestamp.toMillis() : e.timestamp;
+            const date = new Date(ts).toLocaleDateString();
             const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold">🎁 ${e.prize}</span>` : '';
             const isPaid = e.paymentStatus === 'paid';
             const payBtn = `<button

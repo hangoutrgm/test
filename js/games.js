@@ -611,7 +611,7 @@ window.mineGame = async (postId) => {
             return window.showAlert("This Quick Challenge is not for you!");
         }
 
-        await update(postRef, {
+        await updateDoc(postRef, {
             gameStatus: 'ended',
             gameWinner: window.currentUser.uid
         });
@@ -1006,7 +1006,7 @@ window.submitBingoEntry = async () => {
 };
 
 window.closeBingoSubmissions = async (postId) => {
-    await update(ref(db, `community_posts/${postId}`), { bingoPhase: 'drawing' });
+    await updateDoc(doc(fsdb, 'community_posts', postId), { bingoPhase: 'drawing' });
 };
 
 // ---- GLOBAL SPIN WHEEL & ANIMATIONS ----
@@ -1083,9 +1083,10 @@ window.getBingoPool = (post) => {
 };
 
 window.spinBingoWheel = async (postId) => {
-    const snap = await get(ref(db, `community_posts/${postId}`));
+    const postRef = doc(fsdb, 'community_posts', postId);
+    const snap = await getDoc(postRef);
     if (!snap.exists()) return;
-    const post = snap.val();
+    const post = snap.data();
 
     const calledItems = Array.isArray(post.bingoCalledItems) ? post.bingoCalledItems : [];
     const allItems = window.getBingoPool(post);
@@ -1273,6 +1274,7 @@ window.joinSpinNames = async (postId) => {
 
     await updateDoc(doc(fsdb, 'community_posts', postId), {
         [`spinNamesJoined.${window.currentUser.uid}`]: { 
+            uid: window.currentUser.uid,
             name: window.globalUsersCache[window.currentUser.uid]?.name || window.currentUser.uid,
             timestamp: Date.now()
         }
@@ -1313,7 +1315,9 @@ window.drawSpinNamesItem = async (postId) => {
     const btn = document.getElementById(`spin-names-btn-${postId}`);
     if (btn) btn.disabled = true;
 
-    const joined = post.spinNamesJoined ? Object.values(post.spinNamesJoined) : [];
+    const joined = post.spinNamesJoined 
+        ? Object.entries(post.spinNamesJoined).map(([uid, data]) => ({ ...data, uid: data.uid || uid }))
+        : [];
     const existingWinners = Array.isArray(post.spinNamesWinners) ? post.spinNamesWinners : [];
     const winnerUids = existingWinners.map(w => w.uid);
 
