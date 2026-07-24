@@ -1,6 +1,6 @@
 import { db, fsdb } from "./firebase-config.js";
 import { ref, update, remove, set, push, increment, get, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
-import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, deleteField, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, deleteField, serverTimestamp as fsServerTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 // State Variables attached to window to preserve inline HTML function functionality
 window.currentUser = null;
@@ -485,24 +485,24 @@ window.refreshSinglePost = async (postId) => {
             const updatedPost = { id: postId, ...snap.data() };
             const indexAll = window.allPosts.findIndex(p => p.id === postId);
             if (indexAll !== -1) window.allPosts[indexAll] = updatedPost;
-            else window.allPosts.push(updatedPost);
-
+            
             const indexGlobal = window.globalPinnedPosts.findIndex(p => p.id === postId);
             if (indexGlobal !== -1) window.globalPinnedPosts[indexGlobal] = updatedPost;
-
+            
             if (window.profilePinnedPosts) {
                 const indexProfile = window.profilePinnedPosts.findIndex(p => p.id === postId);
                 if (indexProfile !== -1) window.profilePinnedPosts[indexProfile] = updatedPost;
             }
-
+            
+            if (window.pinnedFreshData && window.pinnedFreshData[postId]) {
+                window.pinnedFreshData[postId] = updatedPost;
+            }
+            
             if (window.activeProfileUid) window.renderProfileData(false);
             else window.renderFeed(false);
         }
     } catch (e) {
         console.error("Refresh error:", e);
-    } finally {
-        const btn = document.querySelector(`#post-main-${postId} .fa-arrows-rotate`) || document.querySelector(`#post-profile-${postId} .fa-arrows-rotate`);
-        if (btn) btn.classList.remove('fa-spin');
     }
 };
 
@@ -552,10 +552,10 @@ window.openPinModal = (postId, isProfilePinned, isFeedPinned, authorId) => {
 };
 
 window.executePin = (postId, pinType, targetStatus) => {
-    // 1. Update the flag on the post itself
-    updateDoc(doc(fsdb, 'community_posts', postId), { [pinType]: targetStatus });
+    // 1. We still optionally flag it on the post itself for older queries, but we don't listen to it globally.
+    updateDoc(doc(fsdb, 'community_posts', postId), { [pinType]: targetStatus }).catch(() => {});
 
-    // 2. Update the lightweight settings/pinned index document
+    // 2. The single source of truth for the active feed listeners is the `settings/pinned` document.
     const settingsRef = doc(fsdb, 'settings', 'pinned');
     const field = pinType === 'feedPinned' ? 'feedPinnedIds' : 'profilePinnedIds';
     const change = targetStatus ? arrayUnion(postId) : arrayRemove(postId);
@@ -585,7 +585,7 @@ window.executePin = (postId, pinType, targetStatus) => {
             window.profilePinnedPosts = (window.profilePinnedPosts || []).filter(p => p.id !== postId);
         }
     }
-    window.renderFeed(false);
+    if (typeof window.renderFeed === 'function') window.renderFeed(false);
 };
 
 window.toggleLock = (postId, currentStatus) => {
