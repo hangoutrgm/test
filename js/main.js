@@ -519,6 +519,10 @@ window.listenPosts = () => {
     const dbQuery = query(window._buildBaseQuery(), limit(15));
 
     window.postsUnsubscribe = onSnapshot(dbQuery, { includeMetadataChanges: false }, (snapshot) => {
+        const rawDocs = {};
+        snapshot.forEach(child => rawDocs[child.id] = child.data());
+        if (window.checkGameTimers) window.checkGameTimers(rawDocs);
+
         const livePosts = [];
         snapshot.forEach(child => {
             const p = { id: child.id, ...child.data() };

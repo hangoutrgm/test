@@ -162,12 +162,10 @@ window.repostPost = function(postId) {
 
     window.showConfirm("Are you sure you want to repost this to your profile and bump it in the feed?", async () => {
         try {
-            let originalPost = window.allPosts.find(p => p.id === postId);
-            if (!originalPost) {
-                const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-                if (!snap.exists()) return window.showAlert("Post not found.");
-                originalPost = snap.data();
-            }
+            const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+            if (!snap.exists()) return window.showAlert("Post not found.");
+            
+            const originalPost = snap.data();
 
 
             // Prevent reposting a repost
