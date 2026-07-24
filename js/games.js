@@ -591,9 +591,12 @@ window.mineGame = async (postId) => {
     const postRef = doc(fsdb, 'community_posts', postId);
 
     try {
-        const snap = await getDoc(postRef);
-        if (!snap.exists()) return window.showAlert("Game not found.");
-        const post = snap.data();
+        let post = window.allPosts?.find(p => p.id === postId);
+        if (!post) {
+            const snap = await getDoc(postRef);
+            if (!snap.exists()) return window.showAlert("Game not found.");
+            post = snap.data();
+        }
 
         if (post.gameStatus !== 'active') {
             return window.showAlert("Too late! This game has already ended.");
@@ -638,8 +641,11 @@ window.endLastCommentGame = async (postId) => {
     if (!window.currentUser) return;
     
     try {
-        let snap = await getDoc(doc(fsdb, 'community_posts', postId));
-        let post = snap.data();
+        let post = window.allPosts?.find(p => p.id === postId);
+        if (!post) {
+            const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+            post = snap.data();
+        }
         if (post.gameStatus !== 'active') return; 
         
         // Update gameStatus to ending to lock out others
@@ -695,18 +701,17 @@ window.endLastCommentGame = async (postId) => {
     }
 };
 
-window.checkGameTimers = (postsData) => {
-    if(!postsData) return;
+window.checkGameTimers = () => {
+    if (!window.allPosts) return;
     const now = Date.now();
-    for(const key in postsData) {
-        const p = postsData[key];
+    for (const p of window.allPosts) {
         if (p.isGame && p.gameStatus === 'active' && p.gameEndTime && now >= p.gameEndTime) {
             if (p.gameType === 'last_comment') {
-                window.endLastCommentGame(key);
+                window.endLastCommentGame(p.id);
             } else {
                 // For quick_challenge, challenge, guess_emoji, bring_me_emoji
                 if (p.gameEndTime && p.gameStatus === 'active' && Date.now() > p.gameEndTime) {
-                    updateDoc(doc(fsdb, 'community_posts', key), {
+                    updateDoc(doc(fsdb, 'community_posts', p.id), {
                         gameStatus: 'ended',
                         gameWinner: "none",
                         locked: true
@@ -716,6 +721,9 @@ window.checkGameTimers = (postsData) => {
         }
     }
 };
+
+// Check game timers periodically (every 60 seconds) instead of every snapshot
+setInterval(window.checkGameTimers, 60000);
 
 // UI Timer updater
 setInterval(() => {
@@ -739,9 +747,12 @@ setInterval(() => {
 window.checkChallenge = async (postId) => {
     if (!window.currentUser) return;
     const postRef = doc(fsdb, 'community_posts', postId);
-    const snap = await getDoc(postRef);
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(postRef);
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
 
     if (post.gameStatus !== 'active' || post.gameType !== 'challenge') return;
 
@@ -799,9 +810,12 @@ window.answerGame = async (postId, answer) => {
     const postRef = doc(fsdb, 'community_posts', postId);
 
     try {
-        const snap = await getDoc(postRef);
-        if (!snap.exists()) return window.showAlert("Game not found.");
-        const post = snap.data();
+        let post = window.allPosts?.find(p => p.id === postId);
+        if (!post) {
+            const snap = await getDoc(postRef);
+            if (!snap.exists()) return window.showAlert("Game not found.");
+            post = snap.data();
+        }
 
         if (post.gameStatus !== 'active') {
             return window.showAlert("This game has already ended.");
@@ -879,9 +893,12 @@ window._bingoEntryNumberCount = 0;
 window.openBingoEntryModal = async (postId) => {
     if (!window.currentUser) return window.showAlert("Please sign in to play.");
     
-    const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
 
     if (post.authorId === window.currentUser.uid) return window.showAlert("You cannot enter your own Bingo game.");
     if (post.bingoPhase !== 'submission') return window.showAlert("Submissions are now closed!");
@@ -978,8 +995,11 @@ window.submitBingoEntry = async () => {
 
     try {
         // Re-check phase and deadline
-        const snap = await getDoc(postRef);
-        const post = snap.data();
+        let post = window.allPosts?.find(p => p.id === postId);
+        if (!post) {
+            const snap = await getDoc(postRef);
+            post = snap.data();
+        }
         if (post.bingoPhase !== 'submission') return window.showAlert("Submissions are closed!");
         if (post.gameEndTime && Date.now() >= post.gameEndTime) return window.showAlert("Time's up!");
 
@@ -1084,9 +1104,12 @@ window.getBingoPool = (post) => {
 
 window.spinBingoWheel = async (postId) => {
     const postRef = doc(fsdb, 'community_posts', postId);
-    const snap = await getDoc(postRef);
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(postRef);
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
 
     const calledItems = Array.isArray(post.bingoCalledItems) ? post.bingoCalledItems : [];
     const allItems = window.getBingoPool(post);
@@ -1262,9 +1285,12 @@ window.resetBingoGame = async (postId) => {
 window.joinSpinNames = async (postId) => {
     if (!window.currentUser) return window.showAlert("Please sign in to join.");
     
-    const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
     
     if (post.spinNamesPhase !== 'submission') return window.showAlert("Submissions are closed.");
     if (post.gameEndTime && Date.now() >= post.gameEndTime) return window.showAlert("Time's up!");
@@ -1284,9 +1310,12 @@ window.joinSpinNames = async (postId) => {
 
 window.closeSpinNames = async (postId) => {
     if (!window.currentUser) return;
-    const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
     if (post.authorId !== window.currentUser.uid) return;
     const joined = post.spinNamesJoined ? Object.values(post.spinNamesJoined) : [];
     if (joined.length < 2) return window.showAlert('Need at least 2 players to start the draw.');
@@ -1295,9 +1324,12 @@ window.closeSpinNames = async (postId) => {
 
 window.startSpinNamesWheel = async (postId) => {
     if (!window.currentUser) return;
-    const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
     
     if (!post.spinNamesJoined || Object.keys(post.spinNamesJoined).length === 0) return window.showAlert("No players have joined yet.");
 
@@ -1306,9 +1338,12 @@ window.startSpinNamesWheel = async (postId) => {
 
 window.drawSpinNamesItem = async (postId) => {
     if (!window.currentUser) return;
-    const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-    if (!snap.exists()) return;
-    const post = snap.data();
+    let post = window.allPosts?.find(p => p.id === postId);
+    if (!post) {
+        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+        if (!snap.exists()) return;
+        post = snap.data();
+    }
     if (post.authorId !== window.currentUser.uid) return;
     if (post.spinNamesPhase !== 'drawing') return;
 

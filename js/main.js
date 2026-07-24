@@ -2,21 +2,70 @@
 import { app, auth, db, fsdb } from "./firebase-config.js";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
 import { ref, push, onValue, get, set, update, remove, increment, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
-import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter, deleteField } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+import { collection, doc, addDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter, deleteField } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+window._getDocsFS = getDocs; // expose for loadMorePosts cursor pagination
 
 import "./helpers.js";
 import "./renderers.js";
 
+let presenceInterval = null;
+let serverTimeOffset = 0;
+onValue(ref(db, '.info/serverTimeOffset'), snap => {
+    serverTimeOffset = snap.val() || 0;
+});
+
 const presenceSessionId = `posts_${crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
 const presenceSessionRef = (uid) => ref(db, `presence/${uid}/${presenceSessionId}`);
+
 function startOwnPresence(user = auth.currentUser) {
     if (!user) return;
     const sessionRef = presenceSessionRef(user.uid);
     onDisconnect(sessionRef).remove();
-    set(sessionRef, true);
+    
+    set(sessionRef, serverTimestamp());
+    
+    if (presenceInterval) clearInterval(presenceInterval);
+    
+    presenceInterval = setInterval(async () => {
+        try {
+            await set(sessionRef, serverTimestamp());
+            
+            const snap = await get(ref(db, `presence/${user.uid}`));
+            if (snap.exists()) {
+                const sessions = snap.val();
+                const now = Date.now() + serverTimeOffset;
+                const updates = {};
+                let hasChanges = false;
+                
+                Object.entries(sessions).forEach(([key, val]) => {
+                    if (key.startsWith('posts_') && typeof val === 'number') {
+                        // Estimate server time difference roughly, 3 minutes is safe
+                        if (now - val > 3 * 60000) {
+                            updates[key] = null;
+                            hasChanges = true;
+                        }
+                    }
+                });
+                
+                if (hasChanges) {
+                    await update(ref(db, `presence/${user.uid}`), updates);
+                }
+            }
+        } catch(e) {}
+    }, 60000);
 }
+
 function stopOwnPresence(user = auth.currentUser) {
-    if (user) remove(presenceSessionRef(user.uid));
+    if (presenceInterval) {
+        clearInterval(presenceInterval);
+        presenceInterval = null;
+    }
+    if (user) {
+        const sessionRef = presenceSessionRef(user.uid);
+        onDisconnect(sessionRef).cancel();
+        return remove(sessionRef);
+    }
+    return Promise.resolve();
 }
 
 // ==========================================
@@ -325,7 +374,15 @@ onValue(ref(db, 'presence'), (snap) => {
 
 onValue(ref(db, 'users'), (snap) => {
     window.globalUsersCache = snap.val() || {};
-    if(window.activeProfileUid) window.renderProfileData(false); else window.renderFeed(false);
+    const wasReady = window.usersReady;
+    window.usersReady = true;
+    // If posts arrived before users (race condition), flush the pending render now
+    if (!wasReady && window._pendingPostRender) {
+        window._pendingPostRender = false;
+        window.renderFeed(false);
+    } else {
+        if(window.activeProfileUid) window.renderProfileData(false); else window.renderFeed(false);
+    }
     if(!document.getElementById('members-modal').classList.contains('hidden')) window.renderMembers(false);
     
     if(window.currentUser && window.globalUsersCache[window.currentUser.uid]) {
@@ -377,180 +434,202 @@ window.isLoadingHistory = false;
 window.hasMorePosts = true;
 window.postLimit = 15;
 window.postsUnsubscribe = null;
-window.pinnedUnsubscribes = [];
+window.usersReady = false;   // Gate: don't render posts until users cache is loaded
+window._pendingPostRender = false; // Was a render requested before users were ready?
+window._pinnedSettingsUnsub = null;
 
-window.ensureIndividualPinnedListeners = (posts) => {
-    window.individualPinnedUnsubscribes = window.individualPinnedUnsubscribes || {};
-    window.pinnedFreshData = window.pinnedFreshData || {};
-    posts.forEach(p => {
-        if (!window.individualPinnedUnsubscribes[p.id]) {
-            window.individualPinnedUnsubscribes[p.id] = onSnapshot(doc(fsdb, 'community_posts', p.id), (snapshot) => {
-                if (snapshot.exists()) {
-                    const updatedPost = { id: snapshot.id, ...snapshot.data() };
-                    window.pinnedFreshData[p.id] = updatedPost;
-                    
-                    let needsRender = false;
-                    const idxAll = window.allPosts.findIndex(x => x.id === p.id);
-                    const idxGlobal = window.globalPinnedPosts.findIndex(x => x.id === p.id);
-                    const idxProfile = window.profilePinnedPosts ? window.profilePinnedPosts.findIndex(x => x.id === p.id) : -1;
-                    
-                    if (!updatedPost.feedPinned && !updatedPost.profilePinned && !updatedPost.pinned) {
-                        // It was unpinned. Clean up listener and authoritative data.
-                        window.individualPinnedUnsubscribes[p.id]();
-                        delete window.individualPinnedUnsubscribes[p.id];
-                        delete window.pinnedFreshData[p.id];
-                        
-                        // Remove from caches
-                        if (idxAll !== -1) { window.allPosts.splice(idxAll, 1); needsRender = true; }
-                        if (idxGlobal !== -1) { window.globalPinnedPosts.splice(idxGlobal, 1); needsRender = true; }
-                        if (idxProfile !== -1) { window.profilePinnedPosts.splice(idxProfile, 1); needsRender = true; }
-                    } else {
-                        // Update caches with fresh data
-                        if (idxAll !== -1) { window.allPosts[idxAll] = updatedPost; needsRender = true; }
-                        if (idxGlobal !== -1) { window.globalPinnedPosts[idxGlobal] = updatedPost; needsRender = true; }
-                        if (idxProfile !== -1) { window.profilePinnedPosts[idxProfile] = updatedPost; needsRender = true; }
-                    }
-                    
-                    if (needsRender && !window.isUserTyping && !window._bingoGlobalSpinning) {
-                        if (window.activeProfileUid) window.renderProfileData(false);
-                        else window.renderFeed(false);
-                    }
-                }
-            });
+// ─── NEW: Lightweight pinned posts system ────────────────────────────────────
+// Instead of two collection-wide listeners scanning 700+ posts, we keep a tiny
+// `settings/pinned` document that stores only pinned post IDs. We watch just
+// that one document for real-time admin pin/unpin, then fetch only the specific
+// pinned posts we actually need.
+// Cost: 1 persistent listener on 1 doc (instead of 2 collection scans + N per-post listeners)
+
+window._applyPinnedIds = async (feedIds, profileIds) => {
+    const allNeededIds = [...new Set([...feedIds, ...profileIds])];
+
+    // Fetch any pinned posts that are NOT already in allPosts (they may be old, outside live 15)
+    const missing = allNeededIds.filter(id => !window.allPosts.find(p => p.id === id));
+    const fetched = {};
+    await Promise.all(missing.map(async id => {
+        try {
+            const snap = await getDoc(doc(fsdb, 'community_posts', id));
+            if (snap.exists()) fetched[id] = { id: snap.id, ...snap.data() };
+        } catch(e) { console.warn('Could not fetch pinned post', id, e); }
+    }));
+
+    // Build pinned arrays from allPosts + fetched
+    const getPost = id => window.allPosts.find(p => p.id === id) || fetched[id];
+    window.globalPinnedPosts = feedIds.map(getPost).filter(Boolean);
+    window.profilePinnedPosts = profileIds.map(getPost).filter(Boolean);
+
+    // Make sure pinned posts are also in allPosts so the feed can render them
+    [...window.globalPinnedPosts, ...window.profilePinnedPosts].forEach(p => {
+        if (p && !window.allPosts.find(x => x.id === p.id)) {
+            window.allPosts.push(p);
         }
+    });
+
+    if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+        if (!window.usersReady) {
+            window._pendingPostRender = true;
+        } else {
+            window.renderFeed(false);
+        }
+    }
+};
+
+window.loadPinnedPosts = () => {
+    // Unsubscribe any previous listener
+    if (window._pinnedSettingsUnsub) { window._pinnedSettingsUnsub(); window._pinnedSettingsUnsub = null; }
+
+    // Watch the single settings/pinned document — fires once on load, then only when admin pins/unpins
+    window._pinnedSettingsUnsub = onSnapshot(doc(fsdb, 'settings', 'pinned'), (snap) => {
+        const data = snap.exists() ? snap.data() : {};
+        const feedIds = data.feedPinnedIds || [];
+        const profileIds = data.profilePinnedIds || [];
+        window._pendingFeedPinnedIds = feedIds;
+        window._pendingProfilePinnedIds = profileIds;
+        window._applyPinnedIds(feedIds, profileIds);
     });
 };
 
-window.listenPinnedPosts = () => {
-    window.pinnedUnsubscribes.forEach(unsub => unsub());
-    window.pinnedUnsubscribes = [];
-
-    // Listen for global feed pinned posts
-    const feedPinnedQuery = query(collection(fsdb, 'community_posts'), where('feedPinned', '==', true));
-    window.pinnedUnsubscribes.push(onSnapshot(feedPinnedQuery, (snapshot) => {
-        const postsMap = new Map();
-        // 1. Inject all actively monitored pinned posts to survive unindexed SDK drops
-        if (window.pinnedFreshData) {
-            Object.values(window.pinnedFreshData).forEach(p => {
-                if (!!p.feedPinned || !!p.pinned) postsMap.set(p.id, p);
-            });
-        }
-        // 2. Add anything from the snapshot
-        snapshot.forEach(child => {
-            const p = { id: child.id, ...child.data() };
-            postsMap.set(p.id, p);
-        });
-        
-        const posts = Array.from(postsMap.values());
-        window.globalPinnedPosts = posts;
-        window.ensureIndividualPinnedListeners(posts);
-        if (!window.isUserTyping && !window._bingoGlobalSpinning) {
-            window.renderFeed(false);
-        }
-    }));
-
-    // Listen for profile pinned posts
-    const profilePinnedQuery = query(collection(fsdb, 'community_posts'), where('profilePinned', '==', true));
-    window.pinnedUnsubscribes.push(onSnapshot(profilePinnedQuery, (snapshot) => {
-        const postsMap = new Map();
-        if (window.pinnedFreshData) {
-            Object.values(window.pinnedFreshData).forEach(p => {
-                if (!!p.profilePinned || !!p.pinned) postsMap.set(p.id, p);
-            });
-        }
-        snapshot.forEach(child => {
-            const p = { id: child.id, ...child.data() };
-            postsMap.set(p.id, p);
-        });
-        
-        const posts = Array.from(postsMap.values());
-        window.profilePinnedPosts = posts;
-        window.ensureIndividualPinnedListeners(posts);
-        if (!window.isUserTyping && !window._bingoGlobalSpinning && window.activeProfileUid) {
-            window.renderProfileData(false);
-        }
-    }));
-};
-
-window.listenPosts = () => {
-    if (window.postsUnsubscribe) window.postsUnsubscribe();
-      let dbQuery;
+// Build a base Firestore query with optional filter/author constraints (no limit yet)
+window._buildBaseQuery = () => {
     const postsRef = collection(fsdb, 'community_posts');
     if (window.activeProfileUid) {
-        dbQuery = query(postsRef, where('authorId', '==', window.activeProfileUid), orderBy('timestamp', 'desc'), limit(window.postLimit));
+        return query(postsRef, where('authorId', '==', window.activeProfileUid), orderBy('timestamp', 'desc'));
     } else if (window.currentFilter === 'My Posts' && window.currentUser) {
-        dbQuery = query(postsRef, where('authorId', '==', window.currentUser.uid), orderBy('timestamp', 'desc'), limit(window.postLimit));
+        return query(postsRef, where('authorId', '==', window.currentUser.uid), orderBy('timestamp', 'desc'));
     } else if (window.currentFilter && window.currentFilter !== 'All') {
-        dbQuery = query(postsRef, where('category', '==', window.currentFilter), orderBy('timestamp', 'desc'), limit(window.postLimit));
+        return query(postsRef, where('category', '==', window.currentFilter), orderBy('timestamp', 'desc'));
     } else {
-        dbQuery = query(postsRef, orderBy('timestamp', 'desc'), limit(window.postLimit));
+        return query(postsRef, orderBy('timestamp', 'desc'));
     }
+};
 
-    window.postsUnsubscribe = onSnapshot(dbQuery, (snapshot) => {
-        const rawDocs = {};
-        snapshot.forEach(child => rawDocs[child.id] = child.data());
-        if(window.checkGameTimers) window.checkGameTimers(rawDocs);
-        
-        const newPosts = [];
+// listenPosts: sets a live onSnapshot on the FIRST 15 posts only (for real-time new post updates)
+window.listenPosts = () => {
+    if (window.postsUnsubscribe) window.postsUnsubscribe();
+
+    // Reset pagination state when starting fresh
+    window._lastPostDoc = null;
+    window._historyPosts = [];
+
+    const dbQuery = query(window._buildBaseQuery(), limit(15));
+
+    window.postsUnsubscribe = onSnapshot(dbQuery, { includeMetadataChanges: false }, (snapshot) => {
+        const livePosts = [];
         snapshot.forEach(child => {
             const p = { id: child.id, ...child.data() };
-            // For the main query, just overlay fresh data if it exists
             if (window.pinnedFreshData && window.pinnedFreshData[p.id]) {
-                newPosts.push(window.pinnedFreshData[p.id]);
+                livePosts.push(window.pinnedFreshData[p.id]);
             } else {
-                newPosts.push(p);
+                livePosts.push(p);
             }
         });
-        if (newPosts.length < window.postLimit && window.postLimit > 15) {
-            window.hasMorePosts = false;
+
+        // Store the last doc from the live batch so history pagination knows where to start
+        const snapDocs = snapshot.docs;
+        if (snapDocs.length > 0) {
+            window._liveLastDoc = snapDocs[snapDocs.length - 1];
         }
 
-        // Preserve pinned posts across category/page switches
+        // hasMorePosts: true if we got a full page of 15 (there may be history beyond)
+        window.hasMorePosts = (snapshot.size >= 15);
+
+        // Merge: live posts at top, history pages below (deduplicate)
+        const historyIds = new Set((window._historyPosts || []).map(p => p.id));
+        const mergedLive = livePosts.filter(p => !historyIds.has(p.id));
+        window.allPosts = [...mergedLive, ...(window._historyPosts || [])];
+
+        // Preserve pinned posts
         const previousPinned = window.allPosts.filter(p => !!p.feedPinned || !!p.profilePinned || !!p.pinned);
-        
-        window.allPosts = newPosts;
-        
         window.individualPinnedUnsubscribes = window.individualPinnedUnsubscribes || {};
-
-        // Re-add any pinned posts that were lost in the new query
         previousPinned.forEach(p => {
-            if (!window.allPosts.find(np => np.id === p.id)) {
-                window.allPosts.push(p);
-            }
+            if (!window.allPosts.find(np => np.id === p.id)) window.allPosts.push(p);
         });
-        
-        // Ensure all retained pinned posts have real-time listeners
         window.ensureIndividualPinnedListeners(previousPinned);
-
-        // Cleanup listeners for posts that ARE in the main query now
-        newPosts.forEach(p => {
+        window.allPosts.forEach(p => {
             if (window.individualPinnedUnsubscribes[p.id]) {
                 window.individualPinnedUnsubscribes[p.id]();
                 delete window.individualPinnedUnsubscribes[p.id];
             }
         });
-        
+
         if (!window.isUserTyping && !window._bingoGlobalSpinning) {
-            if (window.activeProfileUid) window.renderProfileData(false);
-            else window.renderFeed(false);
-            if (window.processBingoAnimations) window.processBingoAnimations();
+            if (!window.usersReady) {
+                window._pendingPostRender = true;
+            } else {
+                if (window.activeProfileUid) window.renderProfileData(false);
+                else window.renderFeed(false);
+                if (window.processBingoAnimations) window.processBingoAnimations();
+            }
         }
         window.handleDeepLinks();
         window.isLoadingHistory = false;
     });
 };
 
+// loadMorePosts: fetches the next page of 15 older posts using cursor-based pagination
+// This is a one-time getDocs call, NOT a live listener — old posts don't need live updates
 window.loadMorePosts = async () => {
     if (window.isLoadingHistory || !window.hasMorePosts) return;
-    
     window.isLoadingHistory = true;
-    
-    // Increase limit and listen
-    window.postLimit += 15;
-    window.listenPosts();
+
+    try {
+        // Start after the last doc we have (either last history doc, or last live doc)
+        const cursor = window._lastPostDoc || window._liveLastDoc;
+        if (!cursor) {
+            window.isLoadingHistory = false;
+            return;
+        }
+
+        const pageQuery = query(window._buildBaseQuery(), startAfter(cursor), limit(15));
+        const pageSnap = await window._getDocsFS(pageQuery);
+
+        if (pageSnap.empty) {
+            window.hasMorePosts = false;
+            window.isLoadingHistory = false;
+            if (window.activeProfileUid) window.renderProfileData(false);
+            else window.renderFeed(false);
+            return;
+        }
+
+        // Remember the last doc in this page for the next scroll
+        const pageDocs = pageSnap.docs;
+        window._lastPostDoc = pageDocs[pageDocs.length - 1];
+
+        // hasMorePosts: true only if we got a full page
+        window.hasMorePosts = (pageSnap.size >= 15);
+
+        // Append new page posts to history (avoiding duplicates)
+        const existingIds = new Set(window.allPosts.map(p => p.id));
+        const newHistoryPosts = [];
+        pageDocs.forEach(child => {
+            if (!existingIds.has(child.id)) {
+                const p = { id: child.id, ...child.data() };
+                newHistoryPosts.push(window.pinnedFreshData && window.pinnedFreshData[p.id] ? window.pinnedFreshData[p.id] : p);
+            }
+        });
+
+        window._historyPosts = [...(window._historyPosts || []), ...newHistoryPosts];
+        window.allPosts = [...window.allPosts, ...newHistoryPosts];
+
+        // Expand the render window to show the newly loaded posts immediately
+        window.feedRenderLimit = window.allPosts.length;
+        window.profileRenderLimit = window.allPosts.length;
+
+        if (window.activeProfileUid) window.renderProfileData(false);
+        else window.renderFeed(false);
+    } catch (e) {
+        console.error('loadMorePosts error:', e);
+    } finally {
+        window.isLoadingHistory = false;
+    }
 };
 
-window.listenPinnedPosts();
+window.loadPinnedPosts();
 window.listenPosts();
 
 // ==========================================
@@ -1226,10 +1305,10 @@ document.getElementById('guest-login-btn').addEventListener('click', async () =>
     }
 });
 
-document.getElementById('logout-btn').addEventListener('click', () => { 
-    stopOwnPresence(window.currentUser); 
+document.getElementById('logout-btn').addEventListener('click', async () => { 
+    try { await stopOwnPresence(window.currentUser); } catch(e) {}
     window.logActivity("logged out");
-    signOut(auth); 
+    await signOut(auth); 
     window.showAlert("Logged out successfully!");
 });
 

@@ -1,6 +1,6 @@
 import { db, fsdb } from "./firebase-config.js";
 import { ref, update, remove, set, push, increment, get, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
-import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, deleteField, serverTimestamp as fsServerTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, deleteField, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 // State Variables attached to window to preserve inline HTML function functionality
 window.currentUser = null;
@@ -162,10 +162,12 @@ window.repostPost = function(postId) {
 
     window.showConfirm("Are you sure you want to repost this to your profile and bump it in the feed?", async () => {
         try {
-            const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-            if (!snap.exists()) return window.showAlert("Post not found.");
-            
-            const originalPost = snap.data();
+            let originalPost = window.allPosts.find(p => p.id === postId);
+            if (!originalPost) {
+                const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+                if (!snap.exists()) return window.showAlert("Post not found.");
+                originalPost = snap.data();
+            }
 
 
             // Prevent reposting a repost
@@ -179,7 +181,7 @@ window.repostPost = function(postId) {
                 text: originalPost.text || "",
                 image: originalPost.image || "",
                 category: originalPost.category || "General",
-                timestamp: fsServerTimestamp(),
+                timestamp: Date.now(),
                 pinned: false,
                 edited: false,
                 locked: false,
@@ -442,6 +444,14 @@ window.deleteItem = (dbPath, targetUid) => {
                 if (parts.length === 2) {
                     // It's a post deletion
                     await deleteDoc(doc(fsdb, 'community_posts', postId));
+                    // Clean up pinned settings just in case
+                    try {
+                        const settingsRef = doc(fsdb, 'settings', 'pinned');
+                        await updateDoc(settingsRef, {
+                            feedPinnedIds: arrayRemove(postId),
+                            profilePinnedIds: arrayRemove(postId)
+                        });
+                    } catch(e) { /* ignore if doc doesn't exist */ }
                 } else if (parts.length === 4 && parts[2] === 'comments') {
                     // It's a comment deletion
                     const cId = parts[3];
@@ -477,24 +487,24 @@ window.refreshSinglePost = async (postId) => {
             const updatedPost = { id: postId, ...snap.data() };
             const indexAll = window.allPosts.findIndex(p => p.id === postId);
             if (indexAll !== -1) window.allPosts[indexAll] = updatedPost;
-            
+            else window.allPosts.push(updatedPost);
+
             const indexGlobal = window.globalPinnedPosts.findIndex(p => p.id === postId);
             if (indexGlobal !== -1) window.globalPinnedPosts[indexGlobal] = updatedPost;
-            
+
             if (window.profilePinnedPosts) {
                 const indexProfile = window.profilePinnedPosts.findIndex(p => p.id === postId);
                 if (indexProfile !== -1) window.profilePinnedPosts[indexProfile] = updatedPost;
             }
-            
-            if (window.pinnedFreshData && window.pinnedFreshData[postId]) {
-                window.pinnedFreshData[postId] = updatedPost;
-            }
-            
+
             if (window.activeProfileUid) window.renderProfileData(false);
             else window.renderFeed(false);
         }
     } catch (e) {
         console.error("Refresh error:", e);
+    } finally {
+        const btn = document.querySelector(`#post-main-${postId} .fa-arrows-rotate`) || document.querySelector(`#post-profile-${postId} .fa-arrows-rotate`);
+        if (btn) btn.classList.remove('fa-spin');
     }
 };
 
@@ -544,11 +554,40 @@ window.openPinModal = (postId, isProfilePinned, isFeedPinned, authorId) => {
 };
 
 window.executePin = (postId, pinType, targetStatus) => {
-    updateDoc(doc(fsdb, 'community_posts', postId), { [pinType]: targetStatus }).then(() => {
-        if (window.listenPinnedPosts) {
-            setTimeout(() => window.listenPinnedPosts(), 500); // Give Firebase a moment to sync before re-fetching
-        }
+    // 1. Update the flag on the post itself
+    updateDoc(doc(fsdb, 'community_posts', postId), { [pinType]: targetStatus });
+
+    // 2. Update the lightweight settings/pinned index document
+    const settingsRef = doc(fsdb, 'settings', 'pinned');
+    const field = pinType === 'feedPinned' ? 'feedPinnedIds' : 'profilePinnedIds';
+    const change = targetStatus ? arrayUnion(postId) : arrayRemove(postId);
+    updateDoc(settingsRef, { [field]: change }).catch(() => {
+        // Document may not exist yet — create it
+        import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js")
+            .then(({ setDoc }) => setDoc(settingsRef, { [field]: targetStatus ? [postId] : [] }, { merge: true }));
     });
+
+    // 3. Optimistically update local state so UI reflects immediately (no need to wait for listener)
+    if (targetStatus) {
+        const post = window.allPosts.find(p => p.id === postId);
+        if (post) {
+            post[pinType] = true;
+            if (pinType === 'feedPinned' && !window.globalPinnedPosts.find(p => p.id === postId)) {
+                window.globalPinnedPosts.push(post);
+            } else if (pinType === 'profilePinned' && !window.profilePinnedPosts.find(p => p.id === postId)) {
+                window.profilePinnedPosts.push(post);
+            }
+        }
+    } else {
+        const post = window.allPosts.find(p => p.id === postId);
+        if (post) post[pinType] = false;
+        if (pinType === 'feedPinned') {
+            window.globalPinnedPosts = window.globalPinnedPosts.filter(p => p.id !== postId);
+        } else {
+            window.profilePinnedPosts = (window.profilePinnedPosts || []).filter(p => p.id !== postId);
+        }
+    }
+    window.renderFeed(false);
 };
 
 window.toggleLock = (postId, currentStatus) => {
