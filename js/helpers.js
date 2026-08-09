@@ -69,9 +69,12 @@ window.showConfirm = (msg, onConfirm) => {
 window.logActivity = (actionText) => {
     if (!window.currentUser) return;
     try {
-        const userName = window.globalUsersCache?.[window.currentUser.uid]?.name || 'Unknown User';
+        const userName = window.globalUsersCache?.[window.currentUser.uid]?.name 
+                      || window.currentUser.displayName 
+                      || (window.currentUser.email ? window.currentUser.email.split('@')[0] : 'Unknown User');
         push(ref(db, 'activity_log'), {
             user: userName,
+            userId: window.currentUser.uid,
             action: actionText,
             timestamp: Date.now()
         });
@@ -223,7 +226,7 @@ window.pokeUser = async function(targetUid) {
         }
 
         // Always send a notification
-        push(ref(db, `users/${targetUid}/notifications`), {
+        push(ref(db, `notifications/${targetUid}`), {
             type: 'poke', sourceUid: window.currentUser.uid, timestamp: Date.now(), read: false
         });
 
@@ -418,17 +421,20 @@ window.notifyMentions = (text, postId) => {
     });
     
     uids.forEach(uid => {
-        push(ref(db, `users/${uid}/notifications`), { 
+        push(ref(db, `notifications/${uid}`), { 
             type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
         });
     });
 };
 
 window.isPostPinned = (post, filterContext) => {
+    // Always use the live pinned arrays as source of truth.
+    // Never read post.pinned/post.feedPinned/post.profilePinned from the DB document —
+    // those fields are stale legacy data and will cause old posts to wrongly sort to the top.
     if (filterContext === 'profile') {
-        return !!post.profilePinned || !!post.pinned;
+        return (window.profilePinnedPosts || []).some(p => p.id === post.id);
     }
-    return !!post.feedPinned || (!!post.pinned && window.getRole(post.authorId).level >= 2);
+    return (window.globalPinnedPosts || []).some(p => p.id === post.id);
 };
 
 // API Interactions & Toggles
@@ -475,34 +481,94 @@ window.deleteItem = (dbPath, targetUid) => {
     });
 }
 
+// Registry of per-post live listeners attached via the Refresh button.
+// Key: postId, Value: unsubscribe function
+window._postLiveListeners = window._postLiveListeners || {};
+
 window.refreshSinglePost = async (postId) => {
+    // If already listening, clicking Refresh again stops the listener (toggle off)
+    if (window._postLiveListeners[postId]) {
+        window._postLiveListeners[postId]();
+        delete window._postLiveListeners[postId];
+        // Update button to show it's no longer live
+        const btn = document.querySelector(`#post-main-${postId} .refresh-btn`)
+            || document.querySelector(`#post-profile-${postId} .refresh-btn`);
+        if (btn) {
+            btn.classList.remove('text-green-500');
+            btn.classList.add('text-gray-400');
+            btn.title = 'Refresh Post';
+        }
+        return;
+    }
+
+    // Cap total per-post listeners to avoid Firestore exhaustion
+    const MAX_POST_LISTENERS = 10;
+    const listenerIds = Object.keys(window._postLiveListeners);
+    if (listenerIds.length >= MAX_POST_LISTENERS) {
+        // Evict the oldest listener (first in the map)
+        const evictId = listenerIds[0];
+        window._postLiveListeners[evictId]();
+        delete window._postLiveListeners[evictId];
+        const oldBtn = document.querySelector(`#post-main-${evictId} .refresh-btn`)
+            || document.querySelector(`#post-profile-${evictId} .refresh-btn`);
+        if (oldBtn) {
+            oldBtn.classList.remove('text-green-500');
+            oldBtn.classList.add('text-gray-400');
+            oldBtn.title = 'Refresh Post';
+        }
+    }
+
+    // Animate the button and mark it green to signal "live"
+    const btn = document.querySelector(`#post-main-${postId} .refresh-btn`)
+        || document.querySelector(`#post-profile-${postId} .refresh-btn`);
+    const icon = btn?.querySelector('.fa-arrows-rotate');
+    if (icon) icon.classList.add('fa-spin');
+
     try {
-        const btn = document.querySelector(`#post-main-${postId} .fa-arrows-rotate`) || document.querySelector(`#post-profile-${postId} .fa-arrows-rotate`);
-        if (btn) btn.classList.add('fa-spin');
-        
-        const snap = await getDoc(doc(fsdb, 'community_posts', postId));
-        if (snap.exists()) {
+        const { onSnapshot, doc } = await import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js");
+
+        const unsubscribe = onSnapshot(doc(fsdb, 'community_posts', postId), (snap) => {
+            if (icon) icon.classList.remove('fa-spin');
+
+            if (!snap.exists()) return;
+
             const updatedPost = { id: postId, ...snap.data() };
+
+            // Update in all local caches
             const indexAll = window.allPosts.findIndex(p => p.id === postId);
             if (indexAll !== -1) window.allPosts[indexAll] = updatedPost;
-            
-            const indexGlobal = window.globalPinnedPosts.findIndex(p => p.id === postId);
+
+            const indexGlobal = (window.globalPinnedPosts || []).findIndex(p => p.id === postId);
             if (indexGlobal !== -1) window.globalPinnedPosts[indexGlobal] = updatedPost;
-            
-            if (window.profilePinnedPosts) {
-                const indexProfile = window.profilePinnedPosts.findIndex(p => p.id === postId);
-                if (indexProfile !== -1) window.profilePinnedPosts[indexProfile] = updatedPost;
+
+            const indexProfile = (window.profilePinnedPosts || []).findIndex(p => p.id === postId);
+            if (indexProfile !== -1) window.profilePinnedPosts[indexProfile] = updatedPost;
+
+            // Run game timer check on this newly-live post so it can auto-end if expired
+            if (window.checkGameTimers) {
+                window.checkGameTimers({ [postId]: updatedPost });
             }
-            
-            if (window.pinnedFreshData && window.pinnedFreshData[postId]) {
-                window.pinnedFreshData[postId] = updatedPost;
-            }
-            
+
             if (window.activeProfileUid) window.renderProfileData(false);
             else window.renderFeed(false);
-        }
+
+            // Keep button green to indicate it's live
+            if (btn) {
+                btn.classList.remove('text-gray-400');
+                btn.classList.add('text-green-500');
+                btn.title = 'Live (click to stop)';
+            }
+        }, (e) => {
+            console.error("Live post listener error:", e);
+            if (icon) icon.classList.remove('fa-spin');
+            delete window._postLiveListeners[postId];
+        });
+
+        window._postLiveListeners[postId] = unsubscribe;
+
     } catch (e) {
         console.error("Refresh error:", e);
+        if (icon) icon.classList.remove('fa-spin');
     }
 };
 
@@ -633,7 +699,7 @@ window.toggleFollow = (targetUid) => {
         update(ref(db, `users/${targetUid}`), { points: increment(starsPerFollow) });
         
         if(targetUid !== window.currentUser.uid) {
-            push(ref(db, `users/${targetUid}/notifications`), { 
+            push(ref(db, `notifications/${targetUid}`), { 
                 type: 'follow', sourceUid: window.currentUser.uid, timestamp: Date.now(), read: false 
             });
         }
@@ -642,17 +708,17 @@ window.toggleFollow = (targetUid) => {
 
 window.markNotifRead = (notifId) => {
     if (!window.currentUser) return;
-    update(ref(db, `users/${window.currentUser.uid}/notifications/${notifId}`), { read: true });
+    update(ref(db, `notifications/${window.currentUser.uid}/${notifId}`), { read: true });
 };
 
 window.clearNotifications = () => {
-    const myNotifs = window.globalUsersCache[window.currentUser.uid]?.notifications || {};
+    const myNotifs = window.myNotifications || {};
     let updates = {};
     for(let key in myNotifs) {
         if(!myNotifs[key].read) updates[`${key}/read`] = true;
     }
     if(Object.keys(updates).length > 0) {
-        update(ref(db, `users/${window.currentUser.uid}/notifications`), updates);
+        update(ref(db, `notifications/${window.currentUser.uid}`), updates);
     }
     document.getElementById('notif-modal').classList.add('hidden');
 };

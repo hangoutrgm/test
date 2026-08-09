@@ -1,7 +1,7 @@
 // main.js
 import { app, auth, db, fsdb } from "./firebase-config.js";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
-import { ref, push, onValue, get, set, update, remove, increment, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { ref, push, onValue, get, set, update, remove, increment, onDisconnect, serverTimestamp, query as dbQuery, limitToLast } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 import { collection, doc, addDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter, deleteField } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 window._getDocsFS = getDocs; // expose for loadMorePosts cursor pagination
 
@@ -135,7 +135,7 @@ window.notifyMentions = (text, postId) => {
             const u = window.globalUsersCache[uid];
             // Skip self and guests
             if (uid !== window.currentUser.uid && !u.isGuest && !(u.name && u.name.startsWith("Guest_"))) {
-                push(ref(db, `users/${uid}/notifications`), {
+                push(ref(db, `notifications/${uid}`), {
                     type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
                 });
                 notifiedUids.add(uid);
@@ -148,7 +148,7 @@ window.notifyMentions = (text, postId) => {
         Object.keys(window.globalUsersCache).forEach(uid => {
             // Notify if user is Mod/Admin, not self, and not already notified
             if (uid !== window.currentUser.uid && !notifiedUids.has(uid) && window.getRole(uid).level >= 2) {
-                push(ref(db, `users/${uid}/notifications`), {
+                push(ref(db, `notifications/${uid}`), {
                     type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
                 });
                 notifiedUids.add(uid);
@@ -163,7 +163,7 @@ window.notifyMentions = (text, postId) => {
             const name = match.substring(1).toLowerCase();
             const targetUser = Object.values(window.globalUsersCache).find(u => u.name && u.name.toLowerCase() === name);
             if(targetUser && targetUser.uid !== window.currentUser.uid && !notifiedUids.has(targetUser.uid)) {
-                push(ref(db, `users/${targetUser.uid}/notifications`), {
+                push(ref(db, `notifications/${targetUser.uid}`), {
                     type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
                 });
                 notifiedUids.add(targetUser.uid);
@@ -397,15 +397,28 @@ onValue(ref(db, 'users'), (snap) => {
         });
         const catSelect = document.getElementById('post-category');
         if (role.level === 1 && (catSelect.value === 'Announcements' || catSelect.value === 'Rules')) catSelect.value = 'General';
-        
-        // Local Push Notifications Check
-        const myNotifs = window.globalUsersCache[window.currentUser.uid].notifications || {};
+    }
+    
+    window.handleDeepLinks();
+});
+
+// Dedicated notifications listener — only for the logged-in user, limited to last 100.
+// Kept separate from /users so that notification changes don't re-download all user profiles.
+window._notifUnsubscribe = null;
+window._startNotifListener = (uid) => {
+    if (window._notifUnsubscribe) window._notifUnsubscribe();
+    const notifQuery = dbQuery(ref(db, `notifications/${uid}`), limitToLast(100));
+    window._notifUnsubscribe = onValue(notifQuery, (snap) => {
+        window.myNotifications = snap.val() || {};
+        window.updateNotifBadge();
+
+        // Local push notification check
         let maxTime = window.lastNotifTime || Date.now();
-        Object.values(myNotifs).forEach(n => {
+        Object.values(window.myNotifications).forEach(n => {
             if (!n.read && n.timestamp > (window.lastNotifTime || Date.now())) {
                 if ("Notification" in window && Notification.permission === "granted") {
                     const sourceUser = window.globalUsersCache[n.sourceUid];
-                    const msg = n.type === 'mention' ? `${sourceUser?.name || 'Someone'} mentioned you!` : 
+                    const msg = n.type === 'mention' ? `${sourceUser?.name || 'Someone'} mentioned you!` :
                                 n.type === 'comment' ? `${sourceUser?.name || 'Someone'} commented on your post!` :
                                 `You have a new notification`;
                     const iconUrl = sourceUser?.pic || './icon-192.png';
@@ -421,11 +434,8 @@ onValue(ref(db, 'users'), (snap) => {
             }
         });
         window.lastNotifTime = maxTime;
-    }
-    
-    window.updateNotifBadge();
-    window.handleDeepLinks();
-});
+    });
+};
 
 window.allPosts = [];
 window.globalPinnedPosts = [];
@@ -447,41 +457,62 @@ window.loadPinnedPosts = () => {
 
 window._applyPinnedIds = (ids, pinType) => {
     ids.forEach(id => {
-        if (!window.allPosts.find(p => p.id === id)) {
-            // Need to fetch missing pinned post
+        // Check if this post is already somewhere in memory
+        let existingPost = window.allPosts.find(p => p.id === id)
+            || window.globalPinnedPosts.find(p => p.id === id)
+            || window.profilePinnedPosts.find(p => p.id === id);
+
+        if (!existingPost) {
+            // Fetch the pinned post but do NOT push it into window.allPosts —
+            // that would corrupt the chronological timeline with an out-of-order old post.
             import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js")
                 .then(({ getDoc, doc }) => getDoc(doc(fsdb, 'community_posts', id)))
                 .then(snap => {
                     if (snap.exists()) {
                         const post = { id: snap.id, ...snap.data() };
-                        post[pinType] = true;
-                        window.allPosts.push(post);
                         if (pinType === 'feedPinned') {
                             if (!window.globalPinnedPosts.find(p => p.id === id)) window.globalPinnedPosts.push(post);
                         } else {
                             if (!window.profilePinnedPosts.find(p => p.id === id)) window.profilePinnedPosts.push(post);
                         }
-                        if (typeof window.renderFeed === 'function') window.renderFeed(false);
+                        if (typeof window.renderFeed === 'function') {
+                            if (!window.usersReady) window._pendingPostRender = true;
+                            else window.renderFeed(false);
+                        }
                     }
                 });
         } else {
-            const post = window.allPosts.find(p => p.id === id);
-            post[pinType] = true;
             if (pinType === 'feedPinned') {
-                if (!window.globalPinnedPosts.find(p => p.id === id)) window.globalPinnedPosts.push(post);
+                if (!window.globalPinnedPosts.find(p => p.id === id)) window.globalPinnedPosts.push(existingPost);
             } else {
-                if (!window.profilePinnedPosts.find(p => p.id === id)) window.profilePinnedPosts.push(post);
+                if (!window.profilePinnedPosts.find(p => p.id === id)) window.profilePinnedPosts.push(existingPost);
             }
         }
     });
 
-    // Cleanup unpinned
+    // Cleanup posts that are no longer pinned
     if (pinType === 'feedPinned') {
+        const removed = window.globalPinnedPosts.filter(p => !ids.includes(p.id));
         window.globalPinnedPosts = window.globalPinnedPosts.filter(p => ids.includes(p.id));
+        // If a previously-pinned post was fetched out-of-band into allPosts, remove it
+        // so it doesn't appear as an orphan at the bottom of every paginated batch.
+        removed.forEach(rp => {
+            // Only remove if it was injected purely for pinning (i.e., it's not in _historyPosts from normal pagination)
+            const inHistory = (window._historyPosts || []).some(p => p.id === rp.id);
+            if (!inHistory) window.allPosts = window.allPosts.filter(p => p.id !== rp.id);
+        });
     } else {
+        const removed = window.profilePinnedPosts.filter(p => !ids.includes(p.id));
         window.profilePinnedPosts = window.profilePinnedPosts.filter(p => ids.includes(p.id));
+        removed.forEach(rp => {
+            const inHistory = (window._historyPosts || []).some(p => p.id === rp.id);
+            if (!inHistory) window.allPosts = window.allPosts.filter(p => p.id !== rp.id);
+        });
     }
-    if (typeof window.renderFeed === 'function') window.renderFeed(false);
+    if (typeof window.renderFeed === 'function') {
+        if (!window.usersReady) window._pendingPostRender = true;
+        else window.renderFeed(false);
+    }
 };
 
 // Build a base Firestore query with optional filter/author constraints (no limit yet)
@@ -818,7 +849,7 @@ window.submitComment = async (postId, postAuthorId, prefix) => {
     
     if(window.currentUser.uid !== postAuthorId && postAuthorId !== "undefined") {
         update(ref(db, `users/${postAuthorId}`), { points: increment(pointsToAdd) });
-        push(ref(db, `users/${postAuthorId}/notifications`), { 
+        push(ref(db, `notifications/${postAuthorId}`), { 
             type: 'comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
         });
     }
@@ -841,10 +872,11 @@ window.submitReply = async (postId, commentId, prefix, commentAuthorId) => {
     });
     const pointsToAdd = window.siteSettings.starsPerComment ?? 1;
     update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
-    window.logActivity(`commented on a post by ${commentAuthorId}`);
+    const commentAuthorName = window.globalUsersCache?.[commentAuthorId]?.name || commentAuthorId;
+    window.logActivity(`commented on a post by ${commentAuthorName}`);
     
     if(window.currentUser.uid !== commentAuthorId && commentAuthorId !== "undefined") {
-        push(ref(db, `users/${commentAuthorId}/notifications`), { 
+        push(ref(db, `notifications/${commentAuthorId}`), { 
             type: 'reply', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
         });
     }
@@ -886,11 +918,12 @@ window.react = (postId, postAuthorId, type) => {
         if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") {
             update(ref(db, `users/${postAuthorId}`), { points: increment(likePoints) });
         }
-            push(ref(db, `users/${postAuthorId}/notifications`), { 
+            push(ref(db, `notifications/${postAuthorId}`), { 
                 type: 'react_post', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
         }
-        window.logActivity(`reacted to a post by ${postAuthorId}`);
+        const postAuthorName = window.globalUsersCache?.[postAuthorId]?.name || postAuthorId;
+        window.logActivity(`reacted to a post by ${postAuthorName}`);
     }
 };
 
@@ -925,11 +958,12 @@ window.reactComment = (postId, commentId, commentAuthorId, type) => {
         if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") {
             const likePoints = window.siteSettings.starsPerLike ?? 1;
             update(ref(db, `users/${commentAuthorId}`), { points: increment(likePoints) });
-            push(ref(db, `users/${commentAuthorId}/notifications`), { 
+            push(ref(db, `notifications/${commentAuthorId}`), { 
                 type: 'react_comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
         }
-        window.logActivity(`reacted to a comment by ${commentAuthorId}`);
+        const commentAuthorName = window.globalUsersCache?.[commentAuthorId]?.name || commentAuthorId;
+        window.logActivity(`reacted to a comment by ${commentAuthorName}`);
     }
 };
 
@@ -965,7 +999,7 @@ window.reactReply = (postId, commentId, replyId, replyAuthorId, type) => {
         if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") {
             const likePoints = window.siteSettings.starsPerLike ?? 1;
             update(ref(db, `users/${replyAuthorId}`), { points: increment(likePoints) });
-            push(ref(db, `users/${replyAuthorId}/notifications`), { 
+            push(ref(db, `notifications/${replyAuthorId}`), { 
                 type: 'react_reply', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
             });
         }
@@ -1311,6 +1345,27 @@ onAuthStateChanged(auth, (user) => {
 
         window.updateNotifBadge();
 
+        // Start the dedicated notifications listener for this user
+        if (window._startNotifListener) window._startNotifListener(user.uid);
+
+        // Auto-cleanup: keep only the latest 100 notifications in the database
+        setTimeout(() => {
+            get(ref(db, `notifications/${user.uid}`)).then(snap => {
+                const allNotifs = snap.val();
+                if (allNotifs) {
+                    const keys = Object.keys(allNotifs);
+                    if (keys.length > 100) {
+                        // Sort by timestamp (oldest first)
+                        keys.sort((a, b) => (allNotifs[a].timestamp || 0) - (allNotifs[b].timestamp || 0));
+                        const keysToDelete = keys.slice(0, keys.length - 100);
+                        const updates = {};
+                        keysToDelete.forEach(k => updates[k] = null);
+                        update(ref(db, `notifications/${user.uid}`), updates).catch(e => console.warn("Failed to prune notifications", e));
+                    }
+                }
+            }).catch(e => console.warn("Failed to fetch notifications for pruning", e));
+        }, 5000); // Wait 5 seconds after load to not block initial rendering
+
         if (window.chatInboxUnsubscribe) window.chatInboxUnsubscribe();
         window.chatInboxUnsubscribe = onValue(ref(db, `chatInboxes/${user.uid}`), (snap) => {
             const inbox = snap.val() || {};
@@ -1333,6 +1388,8 @@ onAuthStateChanged(auth, (user) => {
         document.getElementById('user-info').classList.add('hidden');
         document.getElementById('create-post-box').classList.add('hidden');
         if (window.chatInboxUnsubscribe) { window.chatInboxUnsubscribe(); window.chatInboxUnsubscribe = null; }
+        if (window._notifUnsubscribe) { window._notifUnsubscribe(); window._notifUnsubscribe = null; }
+        window.myNotifications = {};
     }
     if(!window.activeProfileUid) window.renderFeed(false);
 });
