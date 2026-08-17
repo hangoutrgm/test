@@ -1,0 +1,1419 @@
+// main.js
+import { app, auth, db, fsdb } from "./firebase-config.js";
+import { createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
+import { ref, push, onValue, get, set, update, remove, increment, onDisconnect, serverTimestamp, query as dbQuery, limitToLast } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+import { collection, doc, addDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit, where, serverTimestamp as fsServerTimestamp, startAfter, deleteField } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+window._getDocsFS = getDocs; // expose for loadMorePosts cursor pagination
+
+import "./helpers.js";
+import "./renderers.js";
+
+let presenceInterval = null;
+let serverTimeOffset = 0;
+onValue(ref(db, '.info/serverTimeOffset'), snap => {
+    serverTimeOffset = snap.val() || 0;
+});
+
+const presenceSessionId = `posts_${crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
+const presenceSessionRef = (uid) => ref(db, `presence/${uid}/${presenceSessionId}`);
+
+function startOwnPresence(user = auth.currentUser) {
+    if (!user) return;
+    const sessionRef = presenceSessionRef(user.uid);
+    onDisconnect(sessionRef).remove();
+    
+    set(sessionRef, serverTimestamp());
+    
+    if (presenceInterval) clearInterval(presenceInterval);
+    
+    presenceInterval = setInterval(async () => {
+        try {
+            await set(sessionRef, serverTimestamp());
+            
+            const snap = await get(ref(db, `presence/${user.uid}`));
+            if (snap.exists()) {
+                const sessions = snap.val();
+                const now = Date.now() + serverTimeOffset;
+                const updates = {};
+                let hasChanges = false;
+                
+                Object.entries(sessions).forEach(([key, val]) => {
+                    if (key.startsWith('posts_') && typeof val === 'number') {
+                        // Estimate server time difference roughly, 3 minutes is safe
+                        if (now - val > 3 * 60000) {
+                            updates[key] = null;
+                            hasChanges = true;
+                        }
+                    }
+                });
+                
+                if (hasChanges) {
+                    await update(ref(db, `presence/${user.uid}`), updates);
+                }
+            }
+        } catch(e) {}
+    }, 60000);
+}
+
+function stopOwnPresence(user = auth.currentUser) {
+    if (presenceInterval) {
+        clearInterval(presenceInterval);
+        presenceInterval = null;
+    }
+    if (user) {
+        const sessionRef = presenceSessionRef(user.uid);
+        onDisconnect(sessionRef).cancel();
+        return remove(sessionRef);
+    }
+    return Promise.resolve();
+}
+
+// ==========================================
+// SEARCH & FILTERS
+// ==========================================
+document.getElementById('post-search').addEventListener('input', window.debounce(() => window.renderFeed(true), 300));
+document.getElementById('member-search').addEventListener('input', window.debounce(() => window.renderMembers(true), 300));
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        window.clearIsolatedPost();
+        document.querySelectorAll('.filter-btn').forEach(b => { b.classList.remove('bg-blue-600', 'text-white'); b.classList.add('bg-gray-200', 'text-gray-700', 'dark:bg-slate-800', 'dark:text-gray-300'); });
+        e.target.classList.add('bg-blue-600', 'text-white'); e.target.classList.remove('bg-gray-200', 'text-gray-700', 'dark:bg-slate-800', 'dark:text-gray-300');
+        window.currentFilter = e.target.getAttribute('data-cat');
+        window.postLimit = 15;
+        window.hasMorePosts = true;
+        window.listenPosts();
+        // Initial render will be handled by listenPosts onValue response
+    });
+});
+
+document.querySelectorAll('.member-filter-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        const targetBtn = e.currentTarget;
+        document.querySelectorAll('.member-filter-btn').forEach(b => { 
+            b.classList.remove('bg-blue-600', 'text-white', 'border-transparent'); 
+            b.classList.add('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300', 'border-gray-200', 'dark:border-slate-700'); 
+        });
+        targetBtn.classList.add('bg-blue-600', 'text-white', 'border-transparent'); 
+        targetBtn.classList.remove('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300', 'border-gray-200', 'dark:border-slate-700');
+        window.currentMemberFilter = targetBtn.getAttribute('data-filter');
+        window.renderMembers(true);
+    });
+});
+
+window.currentRankingFilter = 'Leaderboards';
+document.querySelectorAll('.ranking-filter-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        const targetBtn = e.currentTarget;
+        document.querySelectorAll('.ranking-filter-btn').forEach(b => { 
+            b.classList.remove('bg-blue-600', 'text-white', 'border-transparent'); 
+            b.classList.add('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300', 'border-gray-200', 'dark:border-slate-700'); 
+        });
+        targetBtn.classList.add('bg-blue-600', 'text-white', 'border-transparent'); 
+        targetBtn.classList.remove('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300', 'border-gray-200', 'dark:border-slate-700');
+        window.currentRankingFilter = targetBtn.getAttribute('data-filter');
+        if (window.renderRankings) window.renderRankings(true);
+    });
+});
+
+// ==========================================
+// V6.1 & V6.2 FEATURES: VISIBILITY & MENTIONS
+// ==========================================
+window.postVisibility = 'public';
+window.currentMentionMatch = null;
+
+// V6.2 & V6.9 OVERRIDE: Upgraded notification system with @everyone and @mods capability
+window.notifyMentions = (text, postId) => {
+    if(!window.currentUser) return;
+    const myRole = window.getRole(window.currentUser.uid).level;
+    const notifiedUids = new Set();
+    const textLower = text.toLowerCase();
+    
+    // Check if user is Mod/Admin and triggered @everyone
+    if (myRole >= 2 && textLower.includes('@everyone')) {
+        Object.keys(window.globalUsersCache).forEach(uid => {
+            const u = window.globalUsersCache[uid];
+            // Skip self and guests
+            if (uid !== window.currentUser.uid && !u.isGuest && !(u.name && u.name.startsWith("Guest_"))) {
+                push(ref(db, `notifications/${uid}`), {
+                    type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
+                });
+                notifiedUids.add(uid);
+            }
+        });
+    }
+    
+    // Check for @mods — only mods/admins can use this
+    if (myRole >= 2 && textLower.includes('@mods')) {
+        Object.keys(window.globalUsersCache).forEach(uid => {
+            // Notify if user is Mod/Admin, not self, and not already notified
+            if (uid !== window.currentUser.uid && !notifiedUids.has(uid) && window.getRole(uid).level >= 2) {
+                push(ref(db, `notifications/${uid}`), {
+                    type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
+                });
+                notifiedUids.add(uid);
+            }
+        });
+    }
+    
+    // Standard Individual Mentions
+    const matches = text.match(/@(\w+)/g);
+    if(matches) {
+        matches.forEach(match => {
+            const name = match.substring(1).toLowerCase();
+            const targetUser = Object.values(window.globalUsersCache).find(u => u.name && u.name.toLowerCase() === name);
+            if(targetUser && targetUser.uid !== window.currentUser.uid && !notifiedUids.has(targetUser.uid)) {
+                push(ref(db, `notifications/${targetUser.uid}`), {
+                    type: 'mention', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false
+                });
+                notifiedUids.add(targetUser.uid);
+            }
+        });
+    }
+};
+
+const setupVisibilityToggle = () => {
+    const initToggle = () => {
+        const submitBtn = document.getElementById('submit-post-btn');
+        if (submitBtn && !document.getElementById('visibility-toggle-btn')) {
+            const eyeBtn = document.createElement('button');
+            eyeBtn.id = 'visibility-toggle-btn';
+            eyeBtn.innerHTML = '<i class="fas fa-eye text-blue-500 mr-1 text-xs"></i><span class="text-xs font-bold text-gray-600 dark:text-gray-300">Public</span>';
+            eyeBtn.className = 'px-2.5 py-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-slate-700 transition flex items-center shrink-0 cursor-pointer border border-gray-200 dark:border-slate-600 text-xs';
+            eyeBtn.title = "Public Post";
+            
+            eyeBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                if (window.postVisibility === 'public') {
+                    window.postVisibility = 'private';
+                    eyeBtn.innerHTML = '<i class="fas fa-eye-slash text-gray-400 mr-1 text-xs"></i><span class="text-xs font-bold text-gray-500">Private</span>';
+                    eyeBtn.title = "Private Post (Only you and mentioned users)";
+                    if(window.showAlert) window.showAlert("Post set to Private");
+                } else {
+                    window.postVisibility = 'public';
+                    eyeBtn.innerHTML = '<i class="fas fa-eye text-blue-500 mr-1 text-xs"></i><span class="text-xs font-bold text-gray-600 dark:text-gray-300">Public</span>';
+                    eyeBtn.title = "Public Post";
+                    if(window.showAlert) window.showAlert("Post set to Public");
+                }
+            });
+            
+            // Insert inside the flex group div, before the Post button
+            submitBtn.parentNode.insertBefore(eyeBtn, submitBtn);
+        }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initToggle);
+    } else {
+        initToggle();
+    }
+};
+
+const setupMentionSystem = () => {
+    const initMention = () => {
+        let suggestionBox = document.getElementById('mention-suggestions-box');
+        if (!suggestionBox) {
+            suggestionBox = document.createElement('div');
+            suggestionBox.id = 'mention-suggestions-box';
+            suggestionBox.className = 'hidden absolute z-[120] bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 shadow-lg rounded-md mt-1 overflow-y-auto max-h-48';
+            document.body.appendChild(suggestionBox);
+        }
+
+        let activeInput = null;
+
+        document.addEventListener('input', (e) => {
+            const target = e.target;
+            if (!target.matches('textarea, input[type="text"]')) return;
+
+            const text = target.value;
+            const cursorPosition = target.selectionStart;
+            const textBeforeCursor = text.substring(0, cursorPosition);
+            
+            const match = textBeforeCursor.match(/@(\w*)$/);
+
+            if (match) {
+                activeInput = target;
+                const query = match[1].toLowerCase();
+                window.currentMentionMatch = { query, start: match.index, end: cursorPosition };
+                
+                const myRole = window.currentUser ? window.getRole(window.currentUser.uid).level : 0;
+                const allUsers = Object.values(window.globalUsersCache || {});
+                let matchedUsers = allUsers.filter(u => u.name && u.name.toLowerCase().includes(query)).slice(0, 5);
+                
+                // V6.9 FEATURE: @mods suggestion — only visible to mods/admins
+                if (myRole >= 2 && "mods".includes(query)) {
+                    matchedUsers.unshift({ name: "mods", isMods: true });
+                }
+                
+                // V6.2 FEATURE: @everyone suggestion for Mods and Admins
+                if (myRole >= 2 && "everyone".includes(query)) {
+                    matchedUsers.unshift({ name: "everyone", isEveryone: true });
+                }
+                
+                if (matchedUsers.length > 0) {
+                    suggestionBox.innerHTML = '';
+                    matchedUsers.forEach(u => {
+                        const item = document.createElement('div');
+                        item.className = 'p-2 hover:bg-gray-100 dark:hover:bg-slate-700 cursor-pointer flex items-center gap-2 text-sm text-gray-800 dark:text-gray-200 transition';
+                        
+                        let iconHtml = `<img src="${u.pic || window.generateAvatar(u.uid || 'guest')}" class="w-6 h-6 rounded-full object-cover">`;
+                        if (u.isEveryone) iconHtml = `<div class="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-[10px] shadow-sm"><i class="fa-solid fa-bullhorn"></i></div>`;
+                        else if (u.isMods) iconHtml = `<div class="w-6 h-6 rounded-full bg-green-500 text-white flex items-center justify-center text-[10px] shadow-sm"><i class="fa-solid fa-shield"></i></div>`;
+
+                        let textClass = '';
+                        if (u.isEveryone) textClass = 'font-bold text-red-500';
+                        else if (u.isMods) textClass = 'font-bold text-green-500';
+
+                        item.innerHTML = `${iconHtml} <span class="${textClass}">${u.name}</span>`;
+                        
+                        item.addEventListener('mousedown', (ev) => {
+                            ev.preventDefault(); 
+                            const currentText = activeInput.value;
+                            const newText = currentText.substring(0, window.currentMentionMatch.start) + `@${u.name} ` + currentText.substring(window.currentMentionMatch.end);
+                            activeInput.value = newText;
+                            suggestionBox.classList.add('hidden');
+                            activeInput.focus();
+                        });
+                        suggestionBox.appendChild(item);
+                    });
+
+                    const rect = activeInput.getBoundingClientRect();
+                    suggestionBox.style.top = `${rect.bottom + window.scrollY}px`;
+                    suggestionBox.style.left = `${rect.left + window.scrollX}px`;
+                    suggestionBox.style.width = `${Math.min(300, Math.max(200, rect.width))}px`;
+
+                    suggestionBox.classList.remove('hidden');
+                } else {
+                    suggestionBox.classList.add('hidden');
+                }
+            } else {
+                suggestionBox.classList.add('hidden');
+                window.currentMentionMatch = null;
+            }
+        });
+
+        document.addEventListener('focusout', (e) => {
+            if (activeInput && e.target === activeInput) {
+                setTimeout(() => suggestionBox.classList.add('hidden'), 200);
+            }
+        });
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initMention);
+    } else {
+        initMention();
+    }
+};
+
+setupVisibilityToggle();
+setupMentionSystem();
+
+// ==========================================
+// Typing Detection (v6.3)
+// ==========================================
+
+document.addEventListener("input", (e) => {
+    if (
+        e.target.tagName === "TEXTAREA" ||
+        (e.target.tagName === "INPUT" &&
+         (e.target.type === "text" || e.target.type === "search"))
+    ) {
+
+        window.isUserTyping = true;
+
+        clearTimeout(window.typingTimer);
+
+        window.typingTimer = setTimeout(() => {
+            window.isUserTyping = false;
+
+            // refresh once after typing stops
+            if (window.activeProfileUid)
+                window.renderProfileData(false);
+            else
+                window.renderFeed(false);
+
+        }, 1000);
+    }
+});
+
+
+// ==========================================
+// DB LISTENERS
+// ==========================================
+
+// ==========================================
+// AUTHENTICATION & INITIALIZATION
+// ==========================================
+window.lastNotifTime = Date.now();
+
+window.requestNotificationPermission = async () => {
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+        try { await Notification.requestPermission(); } catch(e) {}
+    }
+};
+
+onValue(ref(db, '.info/connected'), (snap) => {
+    if (snap.val() === true && auth.currentUser) {
+        startOwnPresence(auth.currentUser);
+    }
+});
+
+onValue(ref(db, 'settings'), (snap) => {
+    if (snap.exists()) {
+        window.siteSettings = { ...window.siteSettings, ...snap.val() };
+    }
+});
+
+onValue(ref(db, 'presence'), (snap) => {
+    window.onlineUsers = snap.val() || {};
+    document.getElementById('online-count').innerText = snap.size || 0;
+    if(!document.getElementById('members-modal').classList.contains('hidden')) window.renderMembers(false);
+    if(window.activeProfileUid) window.renderProfileData(false);
+});
+
+onValue(ref(db, 'users'), (snap) => {
+    window.globalUsersCache = snap.val() || {};
+    const wasReady = window.usersReady;
+    window.usersReady = true;
+    // If posts arrived before users (race condition), flush the pending render now
+    if (!wasReady && window._pendingPostRender) {
+        window._pendingPostRender = false;
+        window.renderFeed(false);
+    } else {
+        if(window.activeProfileUid) window.renderProfileData(false); else window.renderFeed(false);
+    }
+    if(!document.getElementById('members-modal').classList.contains('hidden')) window.renderMembers(false);
+    
+    if(window.currentUser && window.globalUsersCache[window.currentUser.uid]) {
+        if (window.globalUsersCache[window.currentUser.uid].pic) {
+            document.getElementById('nav-avatar').src = window.globalUsersCache[window.currentUser.uid].pic;
+        }
+        
+        const role = window.getRole(window.currentUser.uid);
+        document.querySelectorAll('.mod-only').forEach(opt => {
+            if (role.level === 1) { opt.classList.add('hidden'); opt.disabled = true; }
+            else { opt.classList.remove('hidden'); opt.disabled = false; }
+        });
+        const catSelect = document.getElementById('post-category');
+        if (role.level === 1 && (catSelect.value === 'Announcements' || catSelect.value === 'Rules')) catSelect.value = 'General';
+    }
+    
+    window.handleDeepLinks();
+});
+
+// Dedicated notifications listener — only for the logged-in user, limited to last 100.
+// Kept separate from /users so that notification changes don't re-download all user profiles.
+window._notifUnsubscribe = null;
+window._startNotifListener = (uid) => {
+    if (window._notifUnsubscribe) window._notifUnsubscribe();
+    const notifQuery = dbQuery(ref(db, `notifications/${uid}`), limitToLast(100));
+    window._notifUnsubscribe = onValue(notifQuery, (snap) => {
+        window.myNotifications = snap.val() || {};
+        window.updateNotifBadge();
+
+        // Local push notification check
+        let maxTime = window.lastNotifTime || Date.now();
+        Object.values(window.myNotifications).forEach(n => {
+            if (!n.read && n.timestamp > (window.lastNotifTime || Date.now())) {
+                if ("Notification" in window && Notification.permission === "granted") {
+                    const sourceUser = window.globalUsersCache[n.sourceUid];
+                    const msg = n.type === 'mention' ? `${sourceUser?.name || 'Someone'} mentioned you!` :
+                                n.type === 'comment' ? `${sourceUser?.name || 'Someone'} commented on your post!` :
+                                `You have a new notification`;
+                    const iconUrl = sourceUser?.pic || './icon-192.png';
+                    if (navigator.serviceWorker) {
+                        navigator.serviceWorker.ready.then(reg => {
+                            reg.showNotification("Hangout", { body: msg, icon: iconUrl });
+                        }).catch(() => new Notification("Hangout", { body: msg, icon: iconUrl }));
+                    } else {
+                        new Notification("Hangout", { body: msg, icon: iconUrl });
+                    }
+                }
+                if (n.timestamp > maxTime) maxTime = n.timestamp;
+            }
+        });
+        window.lastNotifTime = maxTime;
+    });
+};
+
+window.allPosts = [];
+window.globalPinnedPosts = [];
+window.profilePinnedPosts = [];
+window.isLoadingHistory = false;
+window.hasMorePosts = true;
+window.postLimit = 15;
+window.postsUnsubscribe = null;
+window.usersReady = false;   // Gate: don't render posts until users cache is loaded
+window._pendingPostRender = false; // Was a render requested before users were ready?
+window.loadPinnedPosts = () => {
+    onSnapshot(doc(fsdb, 'settings', 'pinned'), (docSnap) => {
+        if (!docSnap.exists()) return;
+        const data = docSnap.data();
+        window._applyPinnedIds(data.feedPinnedIds || [], 'feedPinned');
+        window._applyPinnedIds(data.profilePinnedIds || [], 'profilePinned');
+    });
+};
+
+window._applyPinnedIds = (ids, pinType) => {
+    ids.forEach(id => {
+        // Check if this post is already somewhere in memory
+        let existingPost = window.allPosts.find(p => p.id === id)
+            || window.globalPinnedPosts.find(p => p.id === id)
+            || window.profilePinnedPosts.find(p => p.id === id);
+
+        if (!existingPost) {
+            // Fetch the pinned post but do NOT push it into window.allPosts —
+            // that would corrupt the chronological timeline with an out-of-order old post.
+            import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js")
+                .then(({ getDoc, doc }) => getDoc(doc(fsdb, 'community_posts', id)))
+                .then(snap => {
+                    if (snap.exists()) {
+                        const post = { id: snap.id, ...snap.data() };
+                        if (pinType === 'feedPinned') {
+                            if (!window.globalPinnedPosts.find(p => p.id === id)) window.globalPinnedPosts.push(post);
+                        } else {
+                            if (!window.profilePinnedPosts.find(p => p.id === id)) window.profilePinnedPosts.push(post);
+                        }
+                        if (typeof window.renderFeed === 'function') {
+                            if (!window.usersReady) window._pendingPostRender = true;
+                            else window.renderFeed(false);
+                        }
+                    }
+                });
+        } else {
+            if (pinType === 'feedPinned') {
+                if (!window.globalPinnedPosts.find(p => p.id === id)) window.globalPinnedPosts.push(existingPost);
+            } else {
+                if (!window.profilePinnedPosts.find(p => p.id === id)) window.profilePinnedPosts.push(existingPost);
+            }
+        }
+    });
+
+    // Cleanup posts that are no longer pinned
+    if (pinType === 'feedPinned') {
+        const removed = window.globalPinnedPosts.filter(p => !ids.includes(p.id));
+        window.globalPinnedPosts = window.globalPinnedPosts.filter(p => ids.includes(p.id));
+        // If a previously-pinned post was fetched out-of-band into allPosts, remove it
+        // so it doesn't appear as an orphan at the bottom of every paginated batch.
+        removed.forEach(rp => {
+            // Only remove if it was injected purely for pinning (i.e., it's not in _historyPosts from normal pagination)
+            const inHistory = (window._historyPosts || []).some(p => p.id === rp.id);
+            if (!inHistory) window.allPosts = window.allPosts.filter(p => p.id !== rp.id);
+        });
+    } else {
+        const removed = window.profilePinnedPosts.filter(p => !ids.includes(p.id));
+        window.profilePinnedPosts = window.profilePinnedPosts.filter(p => ids.includes(p.id));
+        removed.forEach(rp => {
+            const inHistory = (window._historyPosts || []).some(p => p.id === rp.id);
+            if (!inHistory) window.allPosts = window.allPosts.filter(p => p.id !== rp.id);
+        });
+    }
+    if (typeof window.renderFeed === 'function') {
+        if (!window.usersReady) window._pendingPostRender = true;
+        else window.renderFeed(false);
+    }
+};
+
+// Build a base Firestore query with optional filter/author constraints (no limit yet)
+window._buildBaseQuery = () => {
+    const postsRef = collection(fsdb, 'community_posts');
+    if (window.activeProfileUid) {
+        return query(postsRef, where('authorId', '==', window.activeProfileUid), orderBy('timestamp', 'desc'));
+    } else if (window.currentFilter === 'My Posts' && window.currentUser) {
+        return query(postsRef, where('authorId', '==', window.currentUser.uid), orderBy('timestamp', 'desc'));
+    } else if (window.currentFilter && window.currentFilter !== 'All') {
+        return query(postsRef, where('category', '==', window.currentFilter), orderBy('timestamp', 'desc'));
+    } else {
+        return query(postsRef, orderBy('timestamp', 'desc'));
+    }
+};
+
+// listenPosts: sets a live onSnapshot on the FIRST 15 posts only (for real-time new post updates)
+window.listenPosts = () => {
+    if (window.postsUnsubscribe) window.postsUnsubscribe();
+
+    // Reset pagination state when starting fresh
+    window._lastPostDoc = null;
+    window._historyPosts = [];
+
+    const dbQuery = query(window._buildBaseQuery(), limit(15));
+
+    window.postsUnsubscribe = onSnapshot(dbQuery, { includeMetadataChanges: false }, (snapshot) => {
+        const rawDocs = {};
+        snapshot.forEach(child => rawDocs[child.id] = child.data());
+        if (window.checkGameTimers) window.checkGameTimers(rawDocs);
+
+        const livePosts = [];
+        snapshot.forEach(child => {
+            const p = { id: child.id, ...child.data() };
+            livePosts.push(p);
+        });
+
+        // Store the last doc from the live batch so history pagination knows where to start
+        const snapDocs = snapshot.docs;
+        if (snapDocs.length > 0) {
+            window._liveLastDoc = snapDocs[snapDocs.length - 1];
+        }
+
+        // hasMorePosts: true if we got a full page of 15 (there may be history beyond)
+        window.hasMorePosts = (snapshot.size >= 15);
+
+        // Merge: live posts at top, history pages below (deduplicate)
+        const historyIds = new Set((window._historyPosts || []).map(p => p.id));
+        const mergedLive = livePosts.filter(p => !historyIds.has(p.id));
+        window.allPosts = [...mergedLive, ...(window._historyPosts || [])];
+
+        if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+            if (!window.usersReady) {
+                window._pendingPostRender = true;
+            } else {
+                if (window.activeProfileUid) window.renderProfileData(false);
+                else window.renderFeed(false);
+                if (window.processBingoAnimations) window.processBingoAnimations();
+            }
+        }
+        window.handleDeepLinks();
+        window.isLoadingHistory = false;
+    });
+};
+
+// loadMorePosts: fetches the next page of 15 older posts using cursor-based pagination
+// This is a one-time getDocs call, NOT a live listener — old posts don't need live updates
+window.loadMorePosts = async () => {
+    if (window.isLoadingHistory || !window.hasMorePosts) return;
+    window.isLoadingHistory = true;
+
+    try {
+        // Start after the last doc we have (either last history doc, or last live doc)
+        const cursor = window._lastPostDoc || window._liveLastDoc;
+        if (!cursor) {
+            window.isLoadingHistory = false;
+            return;
+        }
+
+        const pageQuery = query(window._buildBaseQuery(), startAfter(cursor), limit(15));
+        const pageSnap = await window._getDocsFS(pageQuery);
+
+        if (pageSnap.empty) {
+            window.hasMorePosts = false;
+            window.isLoadingHistory = false;
+            if (window.activeProfileUid) window.renderProfileData(false);
+            else window.renderFeed(false);
+            return;
+        }
+
+        // Remember the last doc in this page for the next scroll
+        const pageDocs = pageSnap.docs;
+        window._lastPostDoc = pageDocs[pageDocs.length - 1];
+
+        // hasMorePosts: true only if we got a full page
+        window.hasMorePosts = (pageSnap.size >= 15);
+
+        // Append new page posts to history (avoiding duplicates)
+        const existingIds = new Set(window.allPosts.map(p => p.id));
+        const newHistoryPosts = [];
+        pageDocs.forEach(child => {
+            if (!existingIds.has(child.id)) {
+                const p = { id: child.id, ...child.data() };
+                newHistoryPosts.push(window.pinnedFreshData && window.pinnedFreshData[p.id] ? window.pinnedFreshData[p.id] : p);
+            }
+        });
+
+        window._historyPosts = [...(window._historyPosts || []), ...newHistoryPosts];
+        window.allPosts = [...window.allPosts, ...newHistoryPosts];
+
+        // Expand the render window to show the newly loaded posts immediately
+        window.feedRenderLimit = window.allPosts.length;
+        window.profileRenderLimit = window.allPosts.length;
+
+        if (window.activeProfileUid) window.renderProfileData(false);
+        else window.renderFeed(false);
+    } catch (e) {
+        console.error('loadMorePosts error:', e);
+    } finally {
+        window.isLoadingHistory = false;
+    }
+};
+
+window.loadPinnedPosts();
+window.listenPosts();
+
+// ==========================================
+// ==========================================
+// ACTIONS (POST/COMMENT/EDIT)
+// ==========================================
+
+window.checkUploadLimit = () => {
+    if (!window.currentUser) return false;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const uploadsToday = userData.dailyUploads?.date === today ? userData.dailyUploads.count : 0;
+    const limit = window.siteSettings.imageUploadLimit ?? 10;
+    if (uploadsToday >= limit) {
+        window.showAlert(`You have reached your daily limit of ${limit} image uploads.`);
+        return false;
+    }
+    return true;
+};
+
+window.incrementUploadLimit = () => {
+    if (!window.currentUser) return;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const currentCount = userData.dailyUploads?.date === today ? (userData.dailyUploads.count || 0) : 0;
+    update(ref(db, `users/${window.currentUser.uid}/dailyUploads`), { date: today, count: currentCount + 1 });
+};
+
+window.checkVideoUploadLimit = () => {
+    if (!window.currentUser) return false;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const uploadsToday = userData.dailyVideoUploads?.date === today ? userData.dailyVideoUploads.count : 0;
+    const limit = window.siteSettings.videoUploadLimit ?? 3;
+    if (uploadsToday >= limit) {
+        window.showAlert(`You have reached your daily limit of ${limit} video uploads.`);
+        return false;
+    }
+    return true;
+};
+
+window.incrementVideoUploadLimit = () => {
+    if (!window.currentUser) return;
+    const today = new Date().toLocaleDateString('en-CA');
+    const userData = window.globalUsersCache[window.currentUser.uid] || {};
+    const currentCount = userData.dailyVideoUploads?.date === today ? (userData.dailyVideoUploads.count || 0) : 0;
+    update(ref(db, `users/${window.currentUser.uid}/dailyVideoUploads`), { date: today, count: currentCount + 1 });
+};
+
+document.getElementById('post-image-file').addEventListener('change', function() {
+    const file = this.files[0];
+    document.getElementById('file-name').innerText = file ? file.name : '';
+    const previewContainer = document.getElementById('media-preview-container');
+    previewContainer.innerHTML = '';
+    
+    if (file) {
+        if (file.type.startsWith('video/')) {
+            const sizeLimitMB = window.siteSettings.videoSizeLimitMB ?? 20;
+            if (file.size > sizeLimitMB * 1024 * 1024) {
+                window.showAlert(`Video is too large. Max size is ${sizeLimitMB}MB.`);
+                this.value = '';
+                document.getElementById('file-name').innerText = '';
+                previewContainer.classList.add('hidden');
+                return;
+            }
+            previewContainer.classList.remove('hidden');
+            const video = document.createElement('video');
+            video.src = URL.createObjectURL(file);
+            video.controls = true;
+            video.className = "w-full max-h-48 object-contain rounded bg-black";
+            previewContainer.appendChild(video);
+        } else if (file.type.startsWith('image/')) {
+            previewContainer.classList.remove('hidden');
+            const img = document.createElement('img');
+            img.src = URL.createObjectURL(file);
+            img.className = "w-full max-h-48 object-contain rounded bg-gray-100 dark:bg-slate-800";
+            previewContainer.appendChild(img);
+        }
+    } else {
+        previewContainer.classList.add('hidden');
+    }
+});
+
+document.getElementById('submit-post-btn').addEventListener('click', async () => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return; 
+    
+    const text = document.getElementById('post-text').value.trim();
+    const fileInput = document.getElementById('post-image-file');
+    const file = fileInput.files[0];
+    let imgUrl = document.getElementById('post-image-url').value.trim();
+    
+    if (!text && !imgUrl && !file) return;
+    
+    let isVideo = false;
+    if (file) {
+        isVideo = file.type.startsWith('video/');
+        if (isVideo && !window.checkVideoUploadLimit()) return;
+        if (!isVideo && !window.checkUploadLimit()) return;
+        
+        const sizeLimitMB = window.siteSettings.videoSizeLimitMB ?? 20;
+        if (isVideo && file.size > sizeLimitMB * 1024 * 1024) {
+            window.showAlert(`Video is too large. Max size is ${sizeLimitMB}MB.`);
+            return;
+        }
+    }
+    
+    const btn = document.getElementById('submit-post-btn');
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+    btn.disabled = true;
+
+    try {
+        let finalImage = imgUrl; 
+        if (file) {
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+            if (isVideo) {
+                finalImage = await window.uploadToCloudinary(file, window.currentUser.uid);
+                window.incrementVideoUploadLimit();
+            } else {
+                const base64Img = await window.compressImage(file); 
+                finalImage = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
+                window.incrementUploadLimit();
+            }
+        }
+
+        const newPostRef = await addDoc(collection(fsdb, 'community_posts'), {
+            authorId: window.currentUser.uid, text: text, image: finalImage,
+            category: document.getElementById('post-category').value,
+            timestamp: Date.now(), pinned: false, edited: false, locked: false, reactions: {},
+            visibility: window.postVisibility || 'public' 
+        });
+        
+        const pointsToAdd = window.siteSettings.starsPerPost ?? 10;
+        update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
+        window.notifyMentions(text, newPostRef.id);
+        window.logActivity("posted a new update");
+        
+        document.getElementById('post-text').value = '';
+        document.getElementById('post-image-url').value = '';
+        fileInput.value = '';
+        document.getElementById('file-name').innerText = '';
+        const previewContainer = document.getElementById('media-preview-container');
+        if (previewContainer) {
+            previewContainer.innerHTML = '';
+            previewContainer.classList.add('hidden');
+        }
+        window.clearIsolatedPost();
+
+        window.postVisibility = 'public';
+        const eyeBtn = document.getElementById('visibility-toggle-btn');
+        if(eyeBtn) {
+            eyeBtn.innerHTML = '<i class="fas fa-eye text-blue-500 mr-1 text-xs"></i><span class="text-xs font-bold text-gray-600 dark:text-gray-300">Public</span>';
+            eyeBtn.title = "Public Post";
+        }
+        
+    } catch (err) { window.showAlert("Failed to post: " + err.message); }
+    
+    btn.innerText = "Post"; btn.disabled = false;
+});
+
+window.submitComment = async (postId, postAuthorId, prefix) => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return;
+    
+    const input = document.getElementById(`comment-input-${prefix}-${postId}`); 
+    const text = input.value.trim(); 
+    const fileInput = document.getElementById(`comment-image-${prefix}-${postId}`);
+    const file = fileInput ? fileInput.files[0] : null;
+    
+    if (!text && !file) return;
+
+    input.value = '';
+    if (fileInput) { fileInput.value = ''; document.getElementById(`comment-img-name-${prefix}-${postId}`).innerText = ''; }
+    
+    const btn = document.getElementById(`comment-submit-btn-${prefix}-${postId}`);
+    if(btn) { btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>'; btn.disabled = true; }
+    
+    if (file && !window.checkUploadLimit()) {
+        if(btn) { btn.innerText = "Send"; btn.disabled = false; }
+        return;
+    }
+
+    let finalImage = null;
+    if (file) {
+        try { 
+            const base64Img = await window.compressImage(file, true);
+            finalImage = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
+            window.incrementUploadLimit();
+        } catch(e) { 
+            console.error("Compression failed", e); 
+            if(btn) { btn.innerText = "Send"; btn.disabled = false; }
+            return;
+        }
+    }
+
+    input.focus();
+
+    const commentId = doc(collection(fsdb, 'community_posts')).id;
+    await updateDoc(doc(fsdb, 'community_posts', postId), { 
+        [`comments.${commentId}`]: {
+            uid: window.currentUser.uid, 
+            text: text, 
+            image: finalImage,
+            timestamp: Date.now(), 
+            edited: false 
+        }
+    });
+    const pointsToAdd = window.siteSettings.starsPerLike ?? 1;
+    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
+    
+    if(window.currentUser.uid !== postAuthorId && postAuthorId !== "undefined") {
+        update(ref(db, `users/${postAuthorId}`), { points: increment(pointsToAdd) });
+        push(ref(db, `notifications/${postAuthorId}`), { 
+            type: 'comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
+        });
+    }
+
+    window.notifyMentions(text, postId);
+    if(btn) { btn.innerText = "Send"; btn.disabled = false; }
+};
+
+window.submitReply = async (postId, commentId, prefix, commentAuthorId) => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return;
+    const input = document.getElementById(`reply-input-${prefix}-${commentId}`); 
+    const text = input.value.trim(); if (!text) return;
+    
+    input.value = '';
+    
+    const replyId = doc(collection(fsdb, 'community_posts')).id;
+    await updateDoc(doc(fsdb, 'community_posts', postId), {
+        [`comments.${commentId}.replies.${replyId}`]: { uid: window.currentUser.uid, text: text, timestamp: Date.now(), edited: false }
+    });
+    const pointsToAdd = window.siteSettings.starsPerComment ?? 1;
+    update(ref(db, `users/${window.currentUser.uid}`), { points: increment(pointsToAdd) });
+    const commentAuthorName = window.globalUsersCache?.[commentAuthorId]?.name || commentAuthorId;
+    window.logActivity(`commented on a post by ${commentAuthorName}`);
+    
+    if(window.currentUser.uid !== commentAuthorId && commentAuthorId !== "undefined") {
+        push(ref(db, `notifications/${commentAuthorId}`), { 
+            type: 'reply', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
+        });
+    }
+
+    window.notifyMentions(text, postId);
+    window.openRepliesList.add(commentId);
+    input.focus();
+};
+
+window.react = (postId, postAuthorId, type) => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return;
+    let post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId); if(!post) return;
+    
+    let userReactCount = 0;
+    if (post.reactions) {
+        for (let t in post.reactions) {
+            if (post.reactions[t][window.currentUser.uid]) userReactCount++;
+        }
+    }
+    
+    const hasReacted = post.reactions && post.reactions[type] && post.reactions[type][window.currentUser.uid];
+    if(hasReacted) {
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`reactions.${type}.${window.currentUser.uid}`]: deleteField()
+        });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") update(ref(db, `users/${postAuthorId}`), { points: increment(-likePoints) });
+    } else {
+        if (userReactCount >= 3) {
+            window.showAlert("You can only have up to 3 simultaneous reactions on a post.");
+            return;
+        }
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`reactions.${type}.${window.currentUser.uid}`]: true
+        });
+        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") {
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(postAuthorId !== window.currentUser.uid && postAuthorId !== "undefined") {
+            update(ref(db, `users/${postAuthorId}`), { points: increment(likePoints) });
+        }
+            push(ref(db, `notifications/${postAuthorId}`), { 
+                type: 'react_post', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
+            });
+        }
+        const postAuthorName = window.globalUsersCache?.[postAuthorId]?.name || postAuthorId;
+        window.logActivity(`reacted to a post by ${postAuthorName}`);
+    }
+};
+
+window.reactComment = (postId, commentId, commentAuthorId, type) => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return;
+    let post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId); if(!post) return;
+    let comment = post.comments && post.comments[commentId]; if(!comment) return;
+    
+    let userReactCount = 0;
+    if (comment.reactions) {
+        for (let t in comment.reactions) {
+            if (comment.reactions[t][window.currentUser.uid]) userReactCount++;
+        }
+    }
+    
+    const hasReacted = comment.reactions && comment.reactions[type] && comment.reactions[type][window.currentUser.uid];
+    if(hasReacted) {
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`comments.${commentId}.reactions.${type}.${window.currentUser.uid}`]: deleteField()
+        });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") update(ref(db, `users/${commentAuthorId}`), { points: increment(-likePoints) });
+    } else {
+        if (userReactCount >= 3) {
+            window.showAlert("You can only have up to 3 simultaneous reactions on a comment.");
+            return;
+        }
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`comments.${commentId}.reactions.${type}.${window.currentUser.uid}`]: true
+        });
+        if(commentAuthorId !== window.currentUser.uid && commentAuthorId !== "undefined") {
+            const likePoints = window.siteSettings.starsPerLike ?? 1;
+            update(ref(db, `users/${commentAuthorId}`), { points: increment(likePoints) });
+            push(ref(db, `notifications/${commentAuthorId}`), { 
+                type: 'react_comment', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
+            });
+        }
+        const commentAuthorName = window.globalUsersCache?.[commentAuthorId]?.name || commentAuthorId;
+        window.logActivity(`reacted to a comment by ${commentAuthorName}`);
+    }
+};
+
+window.reactReply = (postId, commentId, replyId, replyAuthorId, type) => {
+    if (!window.currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+    if (window.checkBan()) return;
+    let post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId); if(!post) return;
+    let comment = post.comments && post.comments[commentId]; if(!comment) return;
+    let reply = comment.replies && comment.replies[replyId]; if(!reply) return;
+    
+    let userReactCount = 0;
+    if (reply.reactions) {
+        for (let t in reply.reactions) {
+            if (reply.reactions[t][window.currentUser.uid]) userReactCount++;
+        }
+    }
+    
+    const hasReacted = reply.reactions && reply.reactions[type] && reply.reactions[type][window.currentUser.uid];
+    if(hasReacted) {
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`comments.${commentId}.replies.${replyId}.reactions.${type}.${window.currentUser.uid}`]: deleteField()
+        });
+        const likePoints = window.siteSettings.starsPerLike ?? 1;
+        if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") update(ref(db, `users/${replyAuthorId}`), { points: increment(-likePoints) });
+    } else {
+        if (userReactCount >= 3) {
+            window.showAlert("You can only have up to 3 simultaneous reactions on a reply.");
+            return;
+        }
+        updateDoc(doc(fsdb, 'community_posts', postId), {
+            [`comments.${commentId}.replies.${replyId}.reactions.${type}.${window.currentUser.uid}`]: true
+        });
+        if(replyAuthorId !== window.currentUser.uid && replyAuthorId !== "undefined") {
+            const likePoints = window.siteSettings.starsPerLike ?? 1;
+            update(ref(db, `users/${replyAuthorId}`), { points: increment(likePoints) });
+            push(ref(db, `notifications/${replyAuthorId}`), { 
+                type: 'react_reply', sourceUid: window.currentUser.uid, postId: postId, timestamp: Date.now(), read: false 
+            });
+        }
+    }
+};
+
+// ==========================================
+// COMMENT & REPLY UI TOGGLES
+// ==========================================
+window.toggleComments = (postId, prefix) => {
+    const elMain = document.getElementById(`comments-main-${postId}`);
+    const elProf = document.getElementById(`comments-profile-${postId}`);
+    if(window.openComments.has(postId)) { 
+        window.openComments.delete(postId); 
+        if(elMain) elMain.classList.add('hidden'); 
+        if(elProf) elProf.classList.add('hidden'); 
+    } else { 
+        window.openComments.add(postId); 
+        if(elMain) elMain.classList.remove('hidden'); 
+        if(elProf) elProf.classList.remove('hidden'); 
+    }
+};
+
+window.toggleReplyBox = (cId, prefix) => {
+    const elMain = document.getElementById(`reply-box-main-${cId}`);
+    const elProf = document.getElementById(`reply-box-profile-${cId}`);
+    if(window.openReplies.has(cId)) { 
+        window.openReplies.delete(cId); 
+        if(elMain) { elMain.classList.add('hidden'); elMain.classList.remove('flex'); } 
+        if(elProf) { elProf.classList.add('hidden'); elProf.classList.remove('flex'); } 
+    } else { 
+        window.openReplies.add(cId); 
+        if(elMain) { elMain.classList.remove('hidden'); elMain.classList.add('flex'); } 
+        if(elProf) { elProf.classList.remove('hidden'); elProf.classList.add('flex'); } 
+    }
+};
+
+window.toggleRepliesList = (cId, prefix) => {
+    const elMain = document.getElementById(`replies-list-main-${cId}`);
+    const elProf = document.getElementById(`replies-list-profile-${cId}`);
+    if(window.openRepliesList.has(cId)) { 
+        window.openRepliesList.delete(cId); 
+        if(elMain) elMain.classList.add('hidden'); 
+        if(elProf) elProf.classList.add('hidden'); 
+    } else { 
+        window.openRepliesList.add(cId); 
+        if(elMain) elMain.classList.remove('hidden'); 
+        if(elProf) elProf.classList.remove('hidden'); 
+    }
+};
+
+window.toggleCommentSort = (postId) => {
+    const current = window.commentSortState[postId] || 'oldest';
+    window.commentSortState[postId] = current === 'oldest' ? 'newest' : 'oldest';
+    if (window.activeProfileUid) window.renderProfileData(false);
+    else window.renderFeed(false);
+};
+
+window.prepareReplyToReply = (cId, prefix, targetUid) => {
+    const targetName = window.globalUsersCache[targetUid]?.name || "User";
+    const elMain = document.getElementById(`reply-box-main-${cId}`);
+    const elProf = document.getElementById(`reply-box-profile-${cId}`);
+    
+    window.openReplies.add(cId); 
+    if(elMain) { elMain.classList.remove('hidden'); elMain.classList.add('flex'); } 
+    if(elProf) { elProf.classList.remove('hidden'); elProf.classList.add('flex'); } 
+    
+    window.openRepliesList.add(cId);
+    const listMain = document.getElementById(`replies-list-main-${cId}`);
+    const listProf = document.getElementById(`replies-list-profile-${cId}`);
+    if (listMain) listMain.classList.remove('hidden');
+    if (listProf) listProf.classList.remove('hidden');
+
+    const input = document.getElementById(`reply-input-${prefix}-${cId}`);
+    if(input) {
+        input.value = `@${targetName} `;
+        input.focus();
+    }
+};
+
+// ==========================================
+// EDITING & POST CONTROLS
+// ==========================================
+window.openEditModal = (targetData, currentText) => {
+    window.activeEditTarget = targetData;
+    document.getElementById('edit-content-input').value = currentText || "";
+    document.getElementById('edit-modal').classList.remove('hidden');
+    setTimeout(() => document.getElementById('edit-content-input').focus(), 100);
+};
+
+document.getElementById('save-edit-btn').addEventListener('click', () => {
+    if (!window.activeEditTarget) return;
+    const newText = document.getElementById('edit-content-input').value.trim();
+    if (newText !== "") {
+        const dbPath = window.activeEditTarget.path;
+        if (dbPath.startsWith('community_posts/')) {
+            const parts = dbPath.split('/');
+            const postId = parts[1];
+            if (parts.length === 2) {
+                updateDoc(doc(fsdb, 'community_posts', postId), { text: newText, edited: true });
+            } else if (parts.length === 4 && parts[2] === 'comments') {
+                const cId = parts[3];
+                updateDoc(doc(fsdb, 'community_posts', postId), {
+                    [`comments.${cId}.text`]: newText,
+                    [`comments.${cId}.edited`]: true
+                });
+            } else if (parts.length === 6 && parts[2] === 'comments' && parts[4] === 'replies') {
+                const cId = parts[3];
+                const rId = parts[5];
+                updateDoc(doc(fsdb, 'community_posts', postId), {
+                    [`comments.${cId}.replies.${rId}.text`]: newText,
+                    [`comments.${cId}.replies.${rId}.edited`]: true
+                });
+            }
+        } else {
+            // Fallback for RTDB (if any)
+            update(ref(db, window.activeEditTarget.path), { text: newText, edited: true });
+        }
+        window.notifyMentions(newText, window.activeEditTarget.postId);
+    }
+    document.getElementById('edit-modal').classList.add('hidden');
+    window.activeEditTarget = null;
+});
+
+window.editPost = (postId) => {
+    const post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId);
+    if (!post || post.authorId !== window.currentUser.uid) return;
+    window.openEditModal({ path: `community_posts/${postId}`, postId: postId }, post.text);
+};
+
+window.editComment = (postId, cId) => {
+    const post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId);
+    if (!post || !post.comments || !post.comments[cId]) return;
+    const c = post.comments[cId];
+    if (c.uid !== window.currentUser.uid) return;
+    window.openEditModal({ path: `community_posts/${postId}/comments/${cId}`, postId: postId }, c.text);
+};
+
+window.editReply = (postId, cId, rId) => {
+    const post = window.allPosts.find(p => p.id === postId) || (window.globalPinnedPosts || []).find(p => p.id === postId) || (window.profilePinnedPosts || []).find(p => p.id === postId);
+    if (!post || !post.comments || !post.comments[cId] || !post.comments[cId].replies || !post.comments[cId].replies[rId]) return;
+    const r = post.comments[cId].replies[rId];
+    if (r.uid !== window.currentUser.uid) return;
+    window.openEditModal({ path: `community_posts/${postId}/comments/${cId}/replies/${rId}`, postId: postId }, r.text);
+};
+
+window.togglePostVisibility = (postId, currentVis) => {
+    const newVis = currentVis === 'private' ? 'public' : 'private';
+    updateDoc(doc(fsdb, 'community_posts', postId), { visibility: newVis });
+    if(window.showAlert) window.showAlert(`Post updated to ${newVis === 'private' ? 'Private' : 'Public'}`);
+};
+
+
+// ==========================================
+// PROFILE EDITING
+// ==========================================
+document.getElementById('profile-relationship').addEventListener('change', (e) => {
+    const val = e.target.value;
+    if(['In a relationship', 'Engaged', 'Married', 'Complicated'].includes(val)) {
+        document.getElementById('profile-partner').classList.remove('hidden');
+    } else {
+        document.getElementById('profile-partner').classList.add('hidden');
+    }
+});
+
+document.getElementById('view-profile-btn').addEventListener('click', () => {
+    if(window.currentUser) {
+        document.getElementById('profile-modal').classList.add('hidden');
+        window.openProfile(window.currentUser.uid);
+    }
+});
+
+document.getElementById('save-profile-btn').addEventListener('click', async () => {
+    const newNameInput = document.getElementById('profile-name').value.trim();
+    const cache = window.globalUsersCache[window.currentUser.uid] || {};
+    const finalName = newNameInput || cache.name || window.currentUser.displayName || `User_${Math.floor(Math.random()*999)}`;
+    
+    const gender = document.getElementById('profile-gender').value;
+    const relationship = document.getElementById('profile-relationship').value;
+    let partner = document.getElementById('profile-partner').value.trim();
+    const bio = document.getElementById('profile-bio').value.trim();
+    if(!['In a relationship', 'Engaged', 'Married', 'Complicated'].includes(relationship)) partner = '';
+
+    let newPicUrl = document.getElementById('profile-pic-url').value.trim();
+    const fileInput = document.getElementById('profile-pic-file');
+    const file = fileInput.files[0];
+    
+    const btn = document.getElementById('save-profile-btn');
+    btn.innerText = "Saving..."; btn.disabled = true;
+
+    let finalPic = newPicUrl;
+    try {
+        if(file) {
+            const base64Img = await window.compressImage(file);
+            finalPic = await window.uploadToCloudinary(base64Img, window.currentUser.uid);
+        }
+    } catch(e) { console.error("Compression/Upload failed", e); }
+    
+    if(!finalPic) finalPic = cache.pic || window.currentUser.photoURL || window.generateAvatar(window.currentUser.uid);
+
+    // Collect gallery images (up to 4 slots)
+    const galleryImages = [];
+    for (let i = 0; i < 4; i++) {
+        const urlInput = document.querySelector(`.gallery-url-input[data-slot="${i}"]`);
+        const fileInput2 = document.querySelector(`.gallery-file-input[data-slot="${i}"]`);
+        const url = urlInput ? urlInput.value.trim() : '';
+        if (url) galleryImages.push(url);
+    }
+
+    if(window.currentUser) {
+        try {
+            await update(ref(db, `users/${window.currentUser.uid}`), { name: finalName, pic: finalPic, gender, relationship, partner, bio, galleryImages });
+            try { await updateProfile(window.currentUser, { displayName: finalName, photoURL: finalPic }); } catch (e) { }
+            
+            document.getElementById('profile-modal').classList.add('hidden');
+            document.getElementById('nav-avatar').src = finalPic;
+            fileInput.value = '';
+            document.getElementById('profile-pic-url').value = '';
+        } catch(error) {
+            window.showAlert("Error saving profile. Please try again.");
+        }
+    }
+    btn.innerText = "Save Changes"; btn.disabled = false;
+});
+
+// ==========================================
+// AUTHENTICATION & UI
+// ==========================================
+document.getElementById('theme-toggle').addEventListener('click', () => {
+    const html = document.documentElement; html.classList.toggle('dark');
+    localStorage.theme = html.classList.contains('dark') ? 'dark' : 'light';
+});
+
+document.getElementById('open-login-btn').addEventListener('click', () => document.getElementById('auth-modal').classList.remove('hidden'));
+
+document.getElementById('auth-toggle-btn').addEventListener('click', () => {
+    window.isSignUpMode = !window.isSignUpMode;
+    document.getElementById('auth-action-btn').innerText = window.isSignUpMode ? "Create Account" : "Sign In";
+    document.getElementById('auth-toggle-text').innerText = window.isSignUpMode ? "Already have an account?" : "Need an account?";
+    document.getElementById('auth-toggle-btn').innerText = window.isSignUpMode ? "Sign In" : "Sign Up";
+    
+    if(window.isSignUpMode) document.getElementById('forgot-pass-btn').classList.add('hidden');
+    else document.getElementById('forgot-pass-btn').classList.remove('hidden');
+});
+
+const showError = (msg) => { const errEl = document.getElementById('auth-error'); errEl.innerText = msg; errEl.classList.remove('hidden'); }
+
+document.getElementById('forgot-pass-btn').addEventListener('click', async () => {
+    const email = document.getElementById('auth-email').value.trim();
+    if(!email) return showError("Please enter your email address above first.");
+    try {
+        await sendPasswordResetEmail(auth, email);
+        window.showAlert("Password reset email sent! Please check your inbox.");
+    } catch (error) { showError(error.message.replace('Firebase:', '')); }
+});
+
+document.getElementById('auth-action-btn').addEventListener('click', async () => {
+    const email = document.getElementById('auth-email').value;
+    const pass = document.getElementById('auth-password').value;
+    const btn = document.getElementById('auth-action-btn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = `<svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Please wait...`;
+    btn.disabled = true;
+    try {
+        if (window.isSignUpMode) {
+            const cred = await createUserWithEmailAndPassword(auth, email, pass);
+            const newName = `User_${Math.floor(Math.random()*999)}`;
+            const newPic = window.generateAvatar(cred.user.uid);
+            await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
+            
+            update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic });
+            document.getElementById('nav-avatar').src = newPic;
+            window.showAlert("Account created successfully!");
+        } else {
+            await signInWithEmailAndPassword(auth, email, pass);
+            window.showAlert("Signed in successfully!");
+        }
+        document.getElementById('auth-modal').classList.add('hidden');
+    } catch (error) { 
+        showError(error.message.replace('Firebase:', '')); 
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+});
+
+document.getElementById('guest-login-btn').addEventListener('click', async () => {
+    const guestEmail = `guest_${window.deviceId}@hangout.local`, guestPass = window.deviceId + "_secret";
+    const btn = document.getElementById('guest-login-btn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = `<svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-gray-700 dark:text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Please wait...`;
+    btn.disabled = true;
+    try { 
+        await signInWithEmailAndPassword(auth, guestEmail, guestPass); 
+        document.getElementById('auth-modal').classList.add('hidden'); 
+        window.showAlert("Signed in as Guest!");
+    } 
+    catch {
+        try {
+            const cred = await createUserWithEmailAndPassword(auth, guestEmail, guestPass);
+            const newName = `Guest_${Math.floor(Math.random()*999)}`;
+            const newPic = window.generateAvatar(cred.user.uid);
+            await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
+            
+            update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic, isGuest: true });
+            document.getElementById('nav-avatar').src = newPic;
+            document.getElementById('auth-modal').classList.add('hidden');
+            window.showAlert("Guest account created!");
+        } catch(e) { showError("Failed to create guest account."); }
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => { 
+    try { await stopOwnPresence(window.currentUser); } catch(e) {}
+    window.logActivity("logged out");
+    await signOut(auth); 
+    window.showAlert("Logged out successfully!");
+});
+
+onAuthStateChanged(auth, (user) => {
+    window.currentUser = user;
+    if (user) {
+        if (!sessionStorage.getItem('session_started')) {
+            sessionStorage.setItem('session_started', 'true');
+            // Give time for globalUsersCache to populate
+            setTimeout(() => window.logActivity("logged in"), 1000);
+        }
+        update(ref(db, `users/${user.uid}`), { lastSeen: serverTimestamp() });
+        
+        startOwnPresence(user);
+        
+        document.getElementById('open-login-btn').classList.add('hidden');
+        document.getElementById('user-info').classList.remove('hidden');
+        
+        if(!window.globalUsersCache[user.uid]?.isBanned) document.getElementById('create-post-box').classList.remove('hidden');
+        
+        if (window.globalUsersCache[user.uid]?.pic || user.photoURL) {
+            document.getElementById('nav-avatar').src = window.globalUsersCache[user.uid]?.pic || user.photoURL;
+        }
+
+        window.updateNotifBadge();
+
+        // Start the dedicated notifications listener for this user
+        if (window._startNotifListener) window._startNotifListener(user.uid);
+
+        // Auto-cleanup: keep only the latest 100 notifications in the database
+        setTimeout(() => {
+            get(ref(db, `notifications/${user.uid}`)).then(snap => {
+                const allNotifs = snap.val();
+                if (allNotifs) {
+                    const keys = Object.keys(allNotifs);
+                    if (keys.length > 100) {
+                        // Sort by timestamp (oldest first)
+                        keys.sort((a, b) => (allNotifs[a].timestamp || 0) - (allNotifs[b].timestamp || 0));
+                        const keysToDelete = keys.slice(0, keys.length - 100);
+                        const updates = {};
+                        keysToDelete.forEach(k => updates[k] = null);
+                        update(ref(db, `notifications/${user.uid}`), updates).catch(e => console.warn("Failed to prune notifications", e));
+                    }
+                }
+            }).catch(e => console.warn("Failed to fetch notifications for pruning", e));
+        }, 5000); // Wait 5 seconds after load to not block initial rendering
+
+        if (window.chatInboxUnsubscribe) window.chatInboxUnsubscribe();
+        window.chatInboxUnsubscribe = onValue(ref(db, `chatInboxes/${user.uid}`), (snap) => {
+            const inbox = snap.val() || {};
+            let unreadCount = 0;
+            Object.values(inbox).forEach(item => {
+                if (item.unreadCount > 0) unreadCount++;
+            });
+            const badge = document.getElementById('chat-unread-badge');
+            if (badge) {
+                if (unreadCount > 0) {
+                    badge.innerText = unreadCount > 9 ? '9+' : unreadCount;
+                    badge.classList.remove('hidden');
+                } else {
+                    badge.classList.add('hidden');
+                }
+            }
+        });
+    } else {
+        document.getElementById('open-login-btn').classList.remove('hidden');
+        document.getElementById('user-info').classList.add('hidden');
+        document.getElementById('create-post-box').classList.add('hidden');
+        if (window.chatInboxUnsubscribe) { window.chatInboxUnsubscribe(); window.chatInboxUnsubscribe = null; }
+        if (window._notifUnsubscribe) { window._notifUnsubscribe(); window._notifUnsubscribe = null; }
+        window.myNotifications = {};
+    }
+    if(!window.activeProfileUid) window.renderFeed(false);
+});
+
+// ==========================================
+// PWA INSTALLATION LOGIC
+// ==========================================
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+});
+
+document.getElementById('install-pwa-btn')?.addEventListener('click', async () => {
+    try { window.requestNotificationPermission(); } catch(e) {}
+    
+    if (deferredPrompt) {
+        deferredPrompt.prompt();
+        const { outcome } = await deferredPrompt.userChoice;
+        if (outcome === 'accepted') console.log('User accepted the install prompt');
+        deferredPrompt = null;
+    } else {
+        const msg = "To install Hangout, tap your browser's menu (the 3 dots) and select 'Install app' or 'Add to Home screen'.";
+        if (window.showAlert) window.showAlert(msg);
+        else alert(msg);
+    }
+});
