@@ -1,4 +1,4 @@
-import { db, fsdb } from "./firebase-config.js";
+import { db, fsdb, fsdb2, getPostDocRef, getFirestoreForPost, getRoundRobinFsdb, getFirestoreBySource } from "./firebase-config.js";
 import { ref, update, remove, set, push, increment, get, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 import { collection, doc, addDoc, getDoc, updateDoc, deleteDoc, deleteField, serverTimestamp as fsServerTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
@@ -18,6 +18,7 @@ window.openComments = new Set();
 window.openReplies = new Set();
 window.openRepliesList = new Set();
 window.isolatedPostId = null;
+window.isolatedPostData = null;
 
 // Pagination Core States
 window.feedRenderLimit = 15;
@@ -30,6 +31,10 @@ window.membersObserver = null;
 window.deviceId = localStorage.getItem('hangout_device_id') || ('dev_' + Math.random().toString(36).substring(2, 15));
 localStorage.setItem('hangout_device_id', window.deviceId);
 window.activeEditTarget = null;
+
+// Leaderboard periods (v6.4)
+window.lbScope = 'weekly'; // 'overall' | 'weekly' | 'monthly' (weekly is default)
+window.lbPeriodKey = '';    // selected period key for weekly/monthly (history)
 
 // ==========================================
 // V6.1 NEW STATES
@@ -48,7 +53,8 @@ window.siteSettings = {
     starsPerReply: 1,
     starsPerLike: 1,
     starsPerPoked: 5,
-    lbPointsPerWin: 5,
+    pokeLimit: 3,
+    gameHostLbReward: 0,
     maxLbPointsPrize: 100,
     imageUploadLimit: 10,
     videoUploadLimit: 3,
@@ -56,8 +62,39 @@ window.siteSettings = {
     chatImageLimit: 10,
     chatVideoLimit: 3,
     chatVoiceLimit: 10,
-    chatVideoSizeLimitMB: 20
+    chatVideoSizeLimitMB: 20,
+    postCooldownSec: 60,
+    commentCooldownSec: 60,
+    gameLimits: {}
 };
+
+// ==========================================
+// GAME TYPES — master list shared with the
+// admin config page (for per-user limits)
+// ==========================================
+window.gameTypesList = [
+    { type: 'first_to_mine', label: 'First to Mine' },
+    { type: 'last_comment', label: 'Last Comment' },
+    { type: 'challenge', label: 'Challenge' },
+    { type: 'quick_challenge', label: 'Quick Challenge' },
+    { type: 'count_dots', label: 'Count the Dots' },
+    { type: 'tictactoe', label: 'Tic Tac Toe' },
+    { type: 'four_in_a_row', label: '4 in a Row (7x7)' },
+    { type: 'drop_four', label: 'Connect 4' },
+    { type: 'hangman', label: 'Hangman' },
+    { type: 'gibberish', label: 'Gibberish' },
+    { type: 'emoji_riddle', label: 'Emoji Riddle (Movie/Song/Idiom)' },
+    { type: 'guess_emoji', label: 'Guess the Emoji' },
+    { type: 'bring_me_emoji', label: 'Bring Me the Emoji' },
+    { type: 'flags', label: 'Flags' },
+    { type: 'periodic_table', label: 'Periodic Table of Elements' },
+    { type: 'math', label: 'Math' },
+    { type: 'jumbled_words', label: 'Jumbled Words' },
+    { type: 'trivia', label: 'Random Trivia' },
+    { type: 'bingo', label: 'Bingo' },
+    { type: 'spin_names', label: 'Spin the Names' },
+    { type: 'ncl', label: 'NCL (No Challenge Needed)' }
+];
 window.showAlert = (msg) => {
     document.getElementById('custom-alert-msg').innerText = msg;
     document.getElementById('custom-alert-modal').classList.remove('hidden');
@@ -70,18 +107,32 @@ window.showConfirm = (msg, onConfirm) => {
     document.getElementById('custom-confirm-modal').classList.remove('hidden');
 };
 
-window.logActivity = (actionText) => {
+window.logActivity = async (actionText) => {
     if (!window.currentUser) return;
     try {
         const userName = window.globalUsersCache?.[window.currentUser.uid]?.name 
                       || window.currentUser.displayName 
                       || (window.currentUser.email ? window.currentUser.email.split('@')[0] : 'Unknown User');
-        push(ref(db, 'activity_log'), {
+        await push(ref(db, 'activity_log'), {
             user: userName,
             userId: window.currentUser.uid,
             action: actionText,
             timestamp: Date.now()
         });
+
+        // Auto-prune activity_log: keep only the latest 50 logs
+        const snap = await get(ref(db, 'activity_log'));
+        if (snap.exists()) {
+            const allLogs = snap.val();
+            const keys = Object.keys(allLogs);
+            if (keys.length > 50) {
+                keys.sort((a, b) => (allLogs[a].timestamp || 0) - (allLogs[b].timestamp || 0));
+                const toDelete = keys.slice(0, keys.length - 50);
+                const updates = {};
+                toDelete.forEach(k => updates[k] = null);
+                await update(ref(db, 'activity_log'), updates);
+            }
+        }
     } catch(e) {
         console.warn('logActivity failed:', e);
     }
@@ -134,12 +185,56 @@ window.canDelete = function(targetUid) {
     return window.getRole(window.currentUser.uid).level > window.getRole(targetUid).level;
 };
 
+// Toggle admin-only UI buttons (Admin Config in Edit Profile modal). Treasury is for everyone.
+window.updateAdminButtons = () => {
+    const uid = window.currentUser?.uid;
+    const isAdmin = uid === 'IrcAY3gUELNjiRUhMkr7muxNIpm2' || (uid && window.getRole ? window.getRole(uid).level === 3 : false);
+    const adminBtn = document.getElementById('admin-config-btn');
+    if (adminBtn) adminBtn.classList.toggle('hidden', !isAdmin);
+};
+
 window.checkBan = function() {
     if (window.globalUsersCache[window.currentUser?.uid]?.isBanned) {
         window.showAlert("Your account has been banned from interacting by a Moderator.");
         return true;
     }
     return false;
+};
+// Site Control (see /config): settings.pausePosts blocks posting/commenting/reacting
+// for everyone except Admins; settings.pauseChat blocks sending messages in Hangout Chat.
+// Admins always bypass both switches.
+window.checkSitePaused = function(kind = 'post') {
+    const isPaused = kind === 'chat' ? window.siteSettings?.pauseChat : window.siteSettings?.pausePosts;
+    if (!isPaused) return false;
+    const myLevel = window.currentUser ? (window.getRole ? window.getRole(window.currentUser.uid).level : 0) : 0;
+    if (myLevel >= 3 || window.currentUser?.uid === 'IrcAY3gUELNjiRUhMkr7muxNIpm2') return false;
+    window.showAlert(kind === 'chat'
+        ? "Chat is temporarily paused by the admin. You can read messages, but sending is disabled."
+        : "Posting is temporarily paused by the admin. Browsing, reading and reacting to older content is still available.");
+    return true;
+};
+
+// Cooldown gates for posts/reposts and comments/replies (independent timers).
+// Durations set in /config: settings.postCooldownSec and settings.commentCooldownSec (seconds). 0 = disabled.
+
+// Cooldown gates for posts/reposts and comments/replies (independent timers).
+// Durations set in /config: settings.postCooldownSec and settings.commentCooldownSec (seconds). 0 = disabled.
+// Timers stored in RTDB (users/{uid}/lastPostAt, users/{uid}/lastCommentAt) so they apply per-account across devices.
+// Usage: checkActionCooldown('post') or checkActionCooldown('comment')
+window.checkActionCooldown = async function(kind = 'post') {
+    const isComment = kind === 'comment';
+    const cd = Number(window.siteSettings?.[isComment ? 'commentCooldownSec' : 'postCooldownSec'] ?? 0);
+    if (!cd || cd <= 0 || !window.currentUser) return true;
+    try {
+        const snap = await get(ref(db, `users/${window.currentUser.uid}/${isComment ? 'lastCommentAt' : 'lastPostAt'}`));
+        const waitMs = cd * 1000 - (Date.now() - Number(snap.val() || 0));
+        if (waitMs > 0) {
+            window.showAlert(`Please wait ${Math.ceil(waitMs / 1000)}s before ${isComment ? 'commenting' : 'posting'} again.`);
+            return false;
+        }
+        update(ref(db, `users/${window.currentUser.uid}`), { [isComment ? 'lastCommentAt' : 'lastPostAt']: Date.now() });
+        return true;
+    } catch (e) { return true; } // fail-open on read errors
 };
 
 window.timeAgo = (timestamp) => {
@@ -166,14 +261,21 @@ window.copyPostLink = function(postId) {
 window.repostPost = function(postId) {
     if (!window.currentUser) return window.showAlert("Please sign in to repost.");
     if (window.globalUsersCache[window.currentUser.uid]?.isBanned) return window.showAlert("Banned users cannot repost.");
+    // Site Control: reposts create new posts — blocked for non-admins while paused
+    if (window.checkSitePaused && window.checkSitePaused('post')) return;
 
     window.showConfirm("Are you sure you want to repost this to your profile and bump it in the feed?", async () => {
+        if (!(await window.checkActionCooldown('post'))) return;
         try {
-            const snap = await getDoc(doc(fsdb, 'community_posts', postId));
+            const postDocRef = getPostDocRef(postId);
+            let snap = await getDoc(postDocRef);
+            if (!snap.exists()) {
+                const fallbackRef = doc(postDocRef.firestore === fsdb ? fsdb2 : fsdb, 'community_posts', postId);
+                snap = await getDoc(fallbackRef);
+            }
             if (!snap.exists()) return window.showAlert("Post not found.");
             
             const originalPost = snap.data();
-
 
             // Prevent reposting a repost
             const trueOriginalId = originalPost.isRepost ? originalPost.originalPostId : postId;
@@ -181,10 +283,12 @@ window.repostPost = function(postId) {
 
             const isRepostedGame = originalPost.isGame || originalPost.category === 'Games';
 
-            await addDoc(collection(fsdb, 'community_posts'), {
+            const { fsdb: targetFs, dbSource } = getRoundRobinFsdb();
+            const newPostRef = await addDoc(collection(targetFs, 'community_posts'), {
                 authorId: window.currentUser.uid,
                 text: originalPost.text || "",
                 image: originalPost.image || "",
+                ...(Array.isArray(originalPost.images) && originalPost.images.length > 1 ? { images: originalPost.images } : {}),
                 category: originalPost.category || "General",
                 timestamp: Date.now(),
                 pinned: false,
@@ -195,8 +299,10 @@ window.repostPost = function(postId) {
                 isRepost: true,
                 isRepostedGame: isRepostedGame,
                 originalPostId: trueOriginalId,
-                originalAuthorId: trueOriginalAuthorId
+                originalAuthorId: trueOriginalAuthorId,
+                _dbSource: dbSource
             });
+            window._postDbMap.set(newPostRef.id, dbSource);
             window.showAlert("Post reposted successfully!");
         } catch (error) {
             window.showAlert("Failed to repost: " + error.message);
@@ -220,13 +326,22 @@ window.pokeUser = async function(targetUid) {
         const pokeRef = ref(db, `users/${targetUid}/pokesFrom/${window.currentUser.uid}`);
         const snap = await get(pokeRef);
         const data = snap.val() || { count: 0, lastPokedDate: '' };
-        
-        let newCount = data.count;
-        if (data.lastPokedDate !== todayStr) {
-            newCount++;
-            await set(pokeRef, { count: newCount, lastPokedDate: todayStr });
+
+        // Daily poke limit per target (settings.pokeLimit). 0 = unlimited.
+        const pokedToday = data.lastPokedDate === todayStr;
+        const todayCount = pokedToday ? Number(data.count || 0) : 0;
+        const pokeLimit = Number(window.siteSettings.pokeLimit ?? 3);
+        if (pokeLimit > 0 && todayCount >= pokeLimit) {
+            return window.showAlert(`Daily poke limit reached — you can only poke this user ${pokeLimit} time${pokeLimit === 1 ? '' : 's'} a day.`);
+        }
+
+        // Stars are earned on the first poke of the day only; every allowed poke counts and notifies
+        if (!pokedToday) {
+            await set(pokeRef, { count: 1, lastPokedDate: todayStr });
             const pokePoints = window.siteSettings.starsPerPoked ?? 5;
             await update(ref(db, `users/${targetUid}`), { totalPokes: increment(1), points: increment(pokePoints) });
+        } else {
+            await set(pokeRef, { count: todayCount + 1, lastPokedDate: todayStr });
         }
 
         // Always send a notification
@@ -449,9 +564,10 @@ window.deleteItem = (dbPath, targetUid) => {
             if (dbPath.startsWith('community_posts/')) {
                 const parts = dbPath.split('/');
                 const postId = parts[1];
+                const postDocRef = getPostDocRef(postId);
                 if (parts.length === 2) {
                     // It's a post deletion
-                    await deleteDoc(doc(fsdb, 'community_posts', postId));
+                    await deleteDoc(postDocRef);
                     // Clean up pinned settings just in case
                     try {
                         const settingsRef = doc(fsdb, 'settings', 'pinned');
@@ -463,14 +579,14 @@ window.deleteItem = (dbPath, targetUid) => {
                 } else if (parts.length === 4 && parts[2] === 'comments') {
                     // It's a comment deletion
                     const cId = parts[3];
-                    await updateDoc(doc(fsdb, 'community_posts', postId), {
+                    await updateDoc(postDocRef, {
                         [`comments.${cId}`]: deleteField()
                     });
                 } else if (parts.length === 6 && parts[2] === 'comments' && parts[4] === 'replies') {
                     // It's a reply deletion
                     const cId = parts[3];
                     const rId = parts[5];
-                    await updateDoc(doc(fsdb, 'community_posts', postId), {
+                    await updateDoc(postDocRef, {
                         [`comments.${cId}.replies.${rId}`]: deleteField()
                     });
                 }
@@ -529,14 +645,17 @@ window.refreshSinglePost = async (postId) => {
     if (icon) icon.classList.add('fa-spin');
 
     try {
-        const { onSnapshot, doc } = await import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js");
+        const { onSnapshot } = await import("https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js");
+        const postDocRef = getPostDocRef(postId);
 
-        const unsubscribe = onSnapshot(doc(fsdb, 'community_posts', postId), (snap) => {
+        const unsubscribe = onSnapshot(postDocRef, (snap) => {
             if (icon) icon.classList.remove('fa-spin');
 
             if (!snap.exists()) return;
 
-            const updatedPost = { id: postId, ...snap.data() };
+            const dbSource = snap.ref.firestore === fsdb2 ? 2 : 1;
+            const updatedPost = { id: postId, ...snap.data(), _dbSource: dbSource };
+            window._postDbMap.set(postId, dbSource);
 
             // Update in all local caches
             const indexAll = window.allPosts.findIndex(p => p.id === postId);
@@ -560,18 +679,17 @@ window.refreshSinglePost = async (postId) => {
             if (btn) {
                 btn.classList.remove('text-gray-400');
                 btn.classList.add('text-green-500');
-                btn.title = 'Live (click to stop)';
+                btn.title = 'Live Sync Active (Click to stop)';
             }
-        }, (e) => {
-            console.error("Live post listener error:", e);
+        }, (err) => {
+            console.error("Single post listener error:", err);
             if (icon) icon.classList.remove('fa-spin');
-            delete window._postLiveListeners[postId];
         });
 
         window._postLiveListeners[postId] = unsubscribe;
 
     } catch (e) {
-        console.error("Refresh error:", e);
+        console.error("Failed to attach single post listener:", e);
         if (icon) icon.classList.remove('fa-spin');
     }
 };
@@ -623,7 +741,7 @@ window.openPinModal = (postId, isProfilePinned, isFeedPinned, authorId) => {
 
 window.executePin = (postId, pinType, targetStatus) => {
     // 1. We still optionally flag it on the post itself for older queries, but we don't listen to it globally.
-    updateDoc(doc(fsdb, 'community_posts', postId), { [pinType]: targetStatus }).catch(() => {});
+    updateDoc(getPostDocRef(postId), { [pinType]: targetStatus }).catch(() => {});
 
     // 2. The single source of truth for the active feed listeners is the `settings/pinned` document.
     const settingsRef = doc(fsdb, 'settings', 'pinned');
@@ -669,7 +787,7 @@ window.toggleLock = (postId, currentStatus) => {
         return window.showAlert("Mods cannot lock or unlock Game posts.");
     }
     if (roleLevel >= 2 || isAuthor) {
-        updateDoc(doc(fsdb, 'community_posts', postId), { locked: !currentStatus });
+        updateDoc(getPostDocRef(postId), { locked: !currentStatus });
     }
 };
 
@@ -725,4 +843,135 @@ window.clearNotifications = () => {
         update(ref(db, `notifications/${window.currentUser.uid}`), updates);
     }
     document.getElementById('notif-modal').classList.add('hidden');
+};
+
+// ============================================================
+// DATABASE MIGRATION: Move legacy earnings & hostedGames out of /users
+// ============================================================
+window.migrateUserEarningsAndHostedGames = async (uid) => {
+    if (!uid) return;
+    try {
+        const updates = {};
+        let needsUpdate = false;
+
+        // 1. Migrate earnings
+        const earningsSnap = await get(ref(db, `users/${uid}/earnings`));
+        if (earningsSnap.exists()) {
+            const earningsData = earningsSnap.val();
+            for (const key in earningsData) {
+                updates[`earnings/${uid}/${key}`] = earningsData[key];
+            }
+            updates[`users/${uid}/earnings`] = null;
+            needsUpdate = true;
+        }
+
+        // 2. Migrate hostedGames
+        const hostedSnap = await get(ref(db, `users/${uid}/hostedGames`));
+        if (hostedSnap.exists()) {
+            const hostedData = hostedSnap.val();
+            for (const key in hostedData) {
+                updates[`hostedGames/${uid}/${key}`] = hostedData[key];
+            }
+            updates[`users/${uid}/hostedGames`] = null;
+            needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+            await update(ref(db), updates);
+            console.log(`[Migration] Successfully transferred legacy logs for user: ${uid}`);
+        }
+    } catch(e) {
+        console.warn(`[Migration] Skipped/Failed for ${uid}:`, e);
+    }
+};
+
+window.migrateAllLegacyData = async () => {
+    if (!window.currentUser) return window.showAlert("Please log in as admin.");
+    const role = window.getRole(window.currentUser.uid);
+    if (role.level < 3) return window.showAlert("Only Admins can run the full migration.");
+
+    window.showAlert("Starting database migration... Please wait.");
+    try {
+        const usersSnap = await get(ref(db, 'users'));
+        if (!usersSnap.exists()) return window.showAlert("No users found.");
+        const users = usersSnap.val();
+        let migratedCount = 0;
+        const rootUpdates = {};
+
+        for (const uid in users) {
+            const u = users[uid];
+            let userHadData = false;
+            if (u.earnings && typeof u.earnings === 'object') {
+                for (const k in u.earnings) {
+                    rootUpdates[`earnings/${uid}/${k}`] = u.earnings[k];
+                }
+                rootUpdates[`users/${uid}/earnings`] = null;
+                userHadData = true;
+            }
+            if (u.hostedGames && typeof u.hostedGames === 'object') {
+                for (const k in u.hostedGames) {
+                    rootUpdates[`hostedGames/${uid}/${k}`] = u.hostedGames[k];
+                }
+                rootUpdates[`users/${uid}/hostedGames`] = null;
+                userHadData = true;
+            }
+            if (userHadData) migratedCount++;
+        }
+
+        if (Object.keys(rootUpdates).length > 0) {
+            await update(ref(db), rootUpdates);
+            window.showAlert(`🎉 Migration complete! Successfully transferred legacy logs for ${migratedCount} users to separate /earnings and /hostedGames nodes.`);
+        } else {
+            window.showAlert("Database is already fully migrated! No legacy logs found in /users.");
+        }
+    } catch(e) {
+        console.error("Migration error:", e);
+        window.showAlert("Migration error: " + e.message);
+    }
+};
+
+// ==========================================
+// POST MEDIA RENDERER — single media OR Facebook-style collage (up to 4 photos)
+// Layout: 1 = full width · 2 = side-by-side · 3 = big + 2 stacked · 4 = 2x2 grid.
+// Legacy posts with a single `image` field render exactly as before.
+// ==========================================
+window.renderPostMedia = function(post) {
+    const isVideoUrl = (url) => url.includes('/video/upload/') || /\.(mp4|webm|mov|ogg)$/i.test(url);
+    const imgs = Array.isArray(post.images) ? post.images.filter(Boolean) : [];
+
+    // Collage post (photos only, 2-4 images).
+    // Geometry uses inline styles (not utility classes) so the grid shapes are
+    // guaranteed: 2 = side-by-side · 3 = big + 2 equal stacked · 4 = 2x2 grid.
+    if (imgs.length >= 2) {
+        const imgTag = (u) => `<img src="${u}" loading="lazy" class="cursor-pointer hover:opacity-90 transition" style="width:100%;height:100%;object-fit:cover;min-height:0;" onclick="window.viewImage('${u}')">`;
+        const wrapStyle = (extra, height) => `style="display:grid;${extra}gap:2px;height:${height}px;border-radius:8px;overflow:hidden;border:1px solid rgba(128,128,128,0.25);margin-top:8px;"`;
+        let inner = '';
+        if (imgs.length === 2) {
+            inner = `<div ${wrapStyle('grid-template-columns:1fr 1fr;', 220)}>
+                ${imgs.map(imgTag).join('')}
+            </div>`;
+        } else if (imgs.length === 3) {
+            inner = `<div ${wrapStyle('grid-template-columns:1fr 1fr;', 280)}>
+                ${imgTag(imgs[0])}
+                <div style="display:grid;grid-template-rows:1fr 1fr;gap:2px;min-height:0;overflow:hidden;">
+                    ${imgTag(imgs[1])}
+                    ${imgTag(imgs[2])}
+                </div>
+            </div>`;
+        } else {
+            inner = `<div ${wrapStyle('grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;', 300)}>
+                ${imgs.slice(0, 4).map(imgTag).join('')}
+            </div>`;
+        }
+        // `image` mirrors the first collage photo — avoid showing it twice
+        return inner;
+    }
+
+    // Single media (photo or video) — original behavior
+    const media = post.image;
+    if (!media) return '';
+    if (isVideoUrl(media)) {
+        return `<video src="${media}" controls class="w-full rounded-lg mb-2 max-h-96 bg-black mt-2"></video>`;
+    }
+    return `<img src="${media}" loading="lazy" class="w-full rounded-lg mb-2 object-cover max-h-80 border border-gray-100 dark:border-slate-700 shadow-sm mt-2 cursor-pointer hover:opacity-90 transition" onclick="window.viewImage('${media}')">`;
 };

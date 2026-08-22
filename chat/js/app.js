@@ -1,9 +1,10 @@
 import { auth, db, cloudinaryConfig } from '../../js/firebase-config.js';
-import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, updateProfile, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
-import { endBefore, get, limitToLast, onDisconnect, onValue, orderByKey, push, query, ref, remove, runTransaction, set, update } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
+import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, updateProfile, signInAnonymously, GoogleAuthProvider, signInWithPopup } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
+import { endBefore, get, limitToLast, onDisconnect, onValue, orderByKey, push, query, ref, remove, runTransaction, set, update, onChildAdded, onChildChanged, onChildRemoved } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
 
 // Dynamic settings — loaded from Firebase /settings, falls back to safe defaults
-const chatSettings = { chatImageLimit: 10, chatVideoLimit: 3, chatVoiceLimit: 10, chatVideoSizeLimitMB: 20 };
+const chatSettings = { chatImageLimit: 10, chatVideoLimit: 3, chatVoiceLimit: 10, chatVideoSizeLimitMB: 20, chatCooldownSec: 60 };
+let sitePaused = false; // Site Control (/config): when true, only admins can send messages
 onValue(ref(db, 'settings'), (snap) => {
   if (snap.exists()) {
     const s = snap.val();
@@ -11,8 +12,18 @@ onValue(ref(db, 'settings'), (snap) => {
     chatSettings.chatVideoLimit = s.chatVideoLimit ?? 3;
     chatSettings.chatVoiceLimit = s.chatVoiceLimit ?? 10;
     chatSettings.chatVideoSizeLimitMB = s.chatVideoSizeLimitMB ?? 20;
+    chatSettings.chatCooldownSec = s.chatCooldownSec ?? 60;
+    sitePaused = s.pauseChat === true;
+  } else {
+    sitePaused = false;
   }
 });
+
+// Site Control bypass: hardcoded admin UID or isAdmin flag on the user record
+function isSiteAdmin() {
+  if (!state.user) return false;
+  return state.user.uid === 'IrcAY3gUELNjiRUhMkr7muxNIpm2' || state.users[state.user.uid]?.isAdmin === true;
+}
 
 const $ = (id) => document.getElementById(id);
 const state = {
@@ -23,8 +34,13 @@ const state = {
   noMoreOldMessages: false, loadingOldMessages: false, streakData: null, stopPostsNotif: null,
   streaks: {}, stopStreak: null, pinnedMessage: null, stopPinnedMessage: null, mediaRecorder: null, audioChunks: [], recTimerInterval: null, recSeconds: 0
 };
+// Restore users cache immediately so DM names are available before RTDB responds
+try { const cu = localStorage.getItem('hangout-users'); if (cu) state.users = JSON.parse(cu); } catch (e) {}
 const reactions = { like: '👍', love: '❤️', laugh: '😂', wow: '😮', sad: '😢' };
 reactions.angry = '😡';
+// Extended emoji picker (invoked via the "+" button in the message menu)
+const reactionsMore = ['\u{1F525}','\u{1F389}','\u{1F973}','\u{1F923}','\u{1F605}','\u{1F601}','\u{1F64C}','\u{1F4AF}','\u{1F91D}','\u{1F62D}','\u{1F970}','\u{1F60E}','\u{1F914}','\u{1F634}','\u{1F64F}','\u{1F4AA}','\u{1FA77}','\u{1F44F}','\u{1F433}','\u{1F340}','\u{2B50}','\u{1F440}','\u{1F92F}','\u{1F62C}','\u{1F607}','\u{1F917}'];
+
 const fallbackAvatar = (seed = 'hangout') => `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(seed)}&backgroundColor=transparent`;
 const presenceSessionId = `chat_${crypto.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
 
@@ -284,7 +300,7 @@ function renderMessages(rawMessages, jumpToLatest = false) {
   list.innerHTML = rows.map((message) => {
     if (message.isSystem) return `<div id="message-${escapeHtml(message.id)}" class="system-message-row"><span class="system-message-bubble">${escapeHtml(getNickname(message.senderId))} ${escapeHtml(message.text)}</span></div>`;
     const mine = message.senderId === state.user?.uid;
-    const reactionSummary = Object.entries(message.reactions || {}).map(([type, people]) => Object.keys(people || {}).length ? `<span class="reaction-chip">${reactions[type] || ''} ${Object.keys(people).length}</span>` : '').join('');
+    const reactionSummary = Object.entries(message.reactions || {}).map(([type, people]) => Object.keys(people || {}).length ? `<span class="reaction-chip">${reactions[type] || type || '👍'} ${Object.keys(people).length}</span>` : '').join('');
     let quote = '';
     if (message.replyTo) {
       let mediaPreview = '';
@@ -365,40 +381,96 @@ function renderMessages(rawMessages, jumpToLatest = false) {
   }
 }
 
-function closeMessageMenu() { $('message-action-menu').classList.add('hidden'); $('message-action-menu').innerHTML = ''; }
-function showMessageMenu(message, x, y) {
+// ── Message Action Menu (long-press / right-click) ──
+let menuGuardUntil = 0;             // ignore the release tap that closes a long-press
+let menuMoreOpen = false;           // extended emoji picker open state
+
+function closeMessageMenu() {
+  $('message-action-menu').classList.add('hidden');
+  $('message-action-menu').innerHTML = '';
+  menuMoreOpen = false;
+}
+
+// Small inline SVG icon set that follows the currentColor theme
+const menuSvg = {};
+menuSvg.reply = '<svg viewBox="0 0 24 24"><path d="M9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>';
+menuSvg.profile = '<svg viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>';
+menuSvg.pin = '<svg viewBox="0 0 24 24"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.89A2 2 0 0 1 15 10.76V6a3 3 0 0 0-6 0v4.76a2 2 0 0 1-1.11 1.79l-1.78.89A2 2 0 0 0 5 15.24V17z"/><line x1="9" y1="2" x2="15" y2="2"/></svg>';
+menuSvg.unpin = '<svg viewBox="0 0 24 24"><line x1="2" y1="2" x2="22" y2="22"/><line x1="12" y1="17" x2="12" y2="22"/><line x1="9" y1="2" x2="15" y2="2"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.89A2 2 0 0 1 15 10.76V6"/><path d="M9 10.76a2 2 0 0 1-1.11-1.79L6.11 8.08A2 2 0 0 0 5 6.29V6"/></svg>';
+menuSvg.copy = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
+menuSvg.edit = '<svg viewBox="0 0 24 24"><path d="M4 20h4L20 8a2.1 2.1 0 0 0-4-4L4 16z"/><path d="M15 6l4 4"/></svg>';
+menuSvg.delete = '<svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>';
+
+function showMessageMenu(message, x, y, fromLongPress = false) {
   if (!message) return;
   const menu = $('message-action-menu');
-  const reactionButtons = Object.entries(reactions).map(([type, emoji]) => `<button class="reaction-option" type="button" data-menu-action="react" data-reaction="${type}" aria-label="React ${type}">${emoji}</button>`).join('');
-  
+
+  // Quick-set reaction buttons
+  const quickButtons = Object.entries(reactions).map(([type, emoji]) =>
+    `<button class="reaction-option" type="button" data-menu-action="react" data-reaction="${type}" aria-label="React ${type}">${emoji}</button>`).join('');
+
   const senderName = state.users[message.senderId]?.name || getNickname(message.senderId) || 'User';
-  const isGroup = state.activeInboxItem?.isGroup;
-  const canPin = !isGroup || state.activeInboxItem?.creatorId === state.user?.uid;
+  const isGroup = state.activeInboxItem?.isGroup || state.activeThreadId?.startsWith('group_');
+  const canPin = !isGroup || state.activeInboxItem?.creatorId === state.user?.uid || state.user?.isAdmin;
   const isPinned = state.pinnedMessage?.id === message.id;
-  const pinButtonHtml = canPin && !message.isDeleted ? `<button type="button" data-menu-action="${isPinned ? 'unpin' : 'pin'}">${isPinned ? 'Unpin' : 'Pin'}</button>` : '';
+  const isMine = message.senderId === state.user?.uid;
 
-  // Requested order: username, reply, pin, copy (then edit, delete for author)
-  const profileButtonHtml = `<button type="button" data-menu-action="profile" class="menu-profile-btn" title="View ${escapeHtml(senderName)}'s profile">👤 ${escapeHtml(senderName)}</button>`;
+  const icon = (svg, action, title, extra = '') =>
+    `<button class="menu-icon-btn" type="button" data-menu-action="${action}" title="${title}" aria-label="${title}" ${extra}>${svg}</button>`;
 
-  menu.innerHTML = `${reactionButtons}<span class="menu-separator"></span>${profileButtonHtml}<button type="button" data-menu-action="reply">Reply</button>${pinButtonHtml}<button type="button" data-menu-action="copy">Copy</button>${message.senderId === state.user?.uid ? '<button type="button" data-menu-action="edit">Edit</button><button type="button" data-menu-action="delete" style="color: #dc2626;">Delete</button>' : ''}`;
+  const profileBtn = icon(menuSvg.profile, 'profile', `View ${escapeHtml(senderName)}'s profile`);
+  const replyBtn = icon(menuSvg.reply, 'reply', 'Reply');
+  const pinBtn = canPin && !message.isDeleted ? icon(isPinned ? menuSvg.unpin : menuSvg.pin, isPinned ? 'unpin' : 'pin', isPinned ? 'Unpin' : 'Pin') : '';
+  const copyBtn = icon(menuSvg.copy, 'copy', 'Copy text');
+  const ownerBtns = isMine
+    ? icon(menuSvg.edit, 'edit', 'Edit') + icon(menuSvg.delete, 'delete', 'Delete', 'style="--btn-danger:true"')
+    : '';
+  const moreBtn = `<button class="reaction-option menu-more-btn" type="button" data-menu-action="more" title="More emojis" aria-label="More emojis">+</button>`;
+
+  const pickerHtml = menuMoreOpen
+    ? `<div class="menu-emoji-picker">${reactionsMore.filter(e => !Object.values(reactions).includes(e)).map(e =>
+        `<button class="reaction-option" type="button" data-menu-action="react" data-reaction="${e}" aria-label="React ${e}">${e}</button>`).join('')}</div>`
+    : '';
+
+  menu.innerHTML = `<div class="menu-actions-row">${quickButtons}${moreBtn}</div><div class="menu-separator menu-sep-full"></div><div class="menu-actions-row">${profileBtn}${replyBtn}${pinBtn}${copyBtn}${ownerBtns}</div>${pickerHtml}`;
+
   menu.classList.remove('hidden');
-  menu.style.left = `${Math.max(12, Math.min(x, window.innerWidth - menu.offsetWidth - 12))}px`;
-  menu.style.top = `${Math.max(12, Math.min(y, window.innerHeight - menu.offsetHeight - 12))}px`;
+  const menuW = menu.offsetWidth;
+  const menuH = menu.offsetHeight;
+
+  // For long-press (mobile), place menu ABOVE the finger to avoid covering the thumb;
+  // fall back below/above as needed based on available space.
+  const pad = 14;
+  let left = Math.max(pad, Math.min(x, window.innerWidth - menuW - pad));
+  let top;
+  if (fromLongPress) {
+    // Try above the finger first
+    top = y - menuH - 24;
+    if (top < pad) top = Math.min(y + 24, window.innerHeight - menuH - pad);
+  } else {
+    top = Math.max(pad, Math.min(y, window.innerHeight - menuH - pad));
+  }
+  menu.style.left = `${left}px`;
+  menu.style.top = `${Math.max(pad, top)}px`;
+
   menu.querySelectorAll('[data-menu-action]').forEach((button) => button.addEventListener('click', async () => {
+    // Guard: ignore the release tap that immediately follows a long-press open
+    if (Date.now() < menuGuardUntil) return;
     const action = button.dataset.menuAction;
-    if (action === 'react') await toggleReaction(message.id, button.dataset.reaction);
-    if (action === 'profile') openUserProfile(message.senderId);
-    if (action === 'reply') setReply(message);
-    if (action === 'pin') await pinMessage(message);
-    if (action === 'unpin') await unpinMessage();
+    if (action === 'react') { await toggleReaction(message.id, button.dataset.reaction); return closeMessageMenu(); }
+    if (action === 'more') { menuMoreOpen = !menuMoreOpen; return showMessageMenu(message, x, y, fromLongPress); }
+    if (action === 'profile') { closeMessageMenu(); return openUserProfile(message.senderId); }
+    if (action === 'reply') { closeMessageMenu(); return setReply(message); }
+    if (action === 'pin') { closeMessageMenu(); return await pinMessage(message); }
+    if (action === 'unpin') { closeMessageMenu(); return await unpinMessage(); }
+    if (action === 'edit') { closeMessageMenu(); return await editMessage(message); }
+    if (action === 'delete') { closeMessageMenu(); return await deleteMessage(message); }
     if (action === 'copy') {
-      try {
-        await navigator.clipboard.writeText(message.text || '');
-        showToast('Message copied.');
-      } catch (e) { showToast('Could not copy text.'); }
+      closeMessageMenu();
+      try { await navigator.clipboard.writeText(message.text || ''); showToast('Message copied.'); }
+      catch (e) { showToast('Could not copy text.'); }
+      return;
     }
-    if (action === 'edit') await editMessage(message);
-    if (action === 'delete') await deleteMessage(message);
     closeMessageMenu();
   }));
 }
@@ -520,7 +592,9 @@ function wireMessageGestures(rows) {
           longPressed = true;
           if (singleTapTimer) { clearTimeout(singleTapTimer); singleTapTimer = null; }
           lastTapTime = 0;
-          showMessageMenu(message, event.clientX, event.clientY);
+          // Guard window so the release tap (that closes the long-press) can't hit a menu button
+          menuGuardUntil = Date.now() + 300;
+          showMessageMenu(message, event.clientX, event.clientY, true);
         }
       }, 500);
     });
@@ -621,7 +695,7 @@ function wireMessageGestures(rows) {
       event.preventDefault();
       cancelLongPress();
       if (singleTapTimer) { clearTimeout(singleTapTimer); singleTapTimer = null; }
-      showMessageMenu(message, event.clientX, event.clientY);
+      showMessageMenu(message, event.clientX, event.clientY, false);
     });
   });
 
@@ -916,6 +990,13 @@ function cancelVoiceRecording() {
 
 async function sendVoiceMessage(audioBlob) {
   if (!state.user || !state.activeThreadId) return;
+  // Site Control: chat paused — only admins can send voice messages
+  if (sitePaused && !isSiteAdmin()) {
+    showToast('Chat is temporarily paused by the admin.');
+    return;
+  }
+  // Cooldown gate (settings.chatCooldownSec)
+  if (!(await checkChatCooldown())) return;
   try {
     await useVoiceUploadQuota();
   } catch (quotaErr) {
@@ -1257,12 +1338,34 @@ async function restoreStreak() {
   showToast('🔥 Streak restored!');
 }
 
+// Cooldown gate for sending chat messages — text, media and voice (settings.chatCooldownSec). 0 = disabled.
+// Timer stored in RTDB (users/{uid}/lastChatAt) so it applies per-account across devices.
+async function checkChatCooldown() {
+  const cd = Number(chatSettings.chatCooldownSec ?? 0);
+  if (!cd || cd <= 0 || !state.user) return true;
+  try {
+    const snap = await get(ref(db, `users/${state.user.uid}/lastChatAt`));
+    const waitMs = cd * 1000 - (Date.now() - Number(snap.val() || 0));
+    if (waitMs > 0) {
+      showToast(`Please wait ${Math.ceil(waitMs / 1000)}s before sending again.`);
+      return false;
+    }
+    update(ref(db, `users/${state.user.uid}`), { lastChatAt: Date.now() });
+    return true;
+  } catch (e) { return true; } // fail-open on read errors
+}
+
 async function sendMessage(event) {
   event.preventDefault(); if (!state.user || !state.activeThreadId) return;
 
   // Ban check — blocked users cannot send messages
   if (state.users[state.user.uid]?.isBanned) {
     return showToast('You are banned from using Hangout Chat.');
+  }
+
+  // Site Control: chat paused — only admins can send messages
+  if (sitePaused && !isSiteAdmin()) {
+    return showToast('Chat is temporarily paused by the admin.');
   }
 
   if (state.activeThreadId === 'global_announcements') {
@@ -1274,6 +1377,8 @@ async function sendMessage(event) {
     }
   }
   const input = $('message-input'); const text = input.value.trim(); const file = state.pendingImageFile; if (!text && !file) return;
+  // Cooldown gate (settings.chatCooldownSec)
+  if (!(await checkChatCooldown())) return;
   const button = $('send-button'); 
   button.disabled = true;
   const originalButtonHtml = button.innerHTML;
@@ -1311,9 +1416,31 @@ async function sendMessage(event) {
 
 async function toggleReaction(messageId, reaction) {
   if (!state.user || !state.activeThreadId) return;
-  const current = Boolean(state.messages[messageId]?.reactions?.[reaction]?.[state.user.uid]);
-  const updates = Object.fromEntries(Object.keys(reactions).map((type) => [`${type}/${state.user.uid}`, current || type !== reaction ? null : true]));
-  try { await update(ref(db, `chatMessages/${state.activeThreadId}/${messageId}/reactions`), updates); } catch (error) { showToast(`Could not react: ${error.message.replace('Firebase: ', '')}`); }
+  const currentReactions = state.messages[messageId]?.reactions || {};
+  const current = Boolean(currentReactions[reaction]?.[state.user.uid]);
+  
+  const updates = {};
+  // Clear any existing reactions by this user on this message (both standard and custom emoji)
+  Object.keys(currentReactions).forEach((key) => {
+    if (currentReactions[key]?.[state.user.uid]) {
+      updates[`${key}/${state.user.uid}`] = null;
+    }
+  });
+  // Clear standard reaction slots for this user as well to be completely robust
+  Object.keys(reactions).forEach((type) => {
+    updates[`${type}/${state.user.uid}`] = null;
+  });
+
+  // If adding/changing reaction (and it wasn't already active), set it to true
+  if (!current) {
+    updates[`${reaction}/${state.user.uid}`] = true;
+  }
+
+  try { 
+    await update(ref(db, `chatMessages/${state.activeThreadId}/${messageId}/reactions`), updates); 
+  } catch (error) { 
+    showToast(`Could not react: ${error.message.replace('Firebase: ', '')}`); 
+  }
 }
 function setReply(message) { 
   if (!message) return; 
@@ -1498,13 +1625,61 @@ function handleInbox(snapshot) {
   markThreadRead();
 }
 
-onValue(ref(db, 'users'), (snapshot) => { const raw = snapshot.val() || {}; state.users = Object.fromEntries(Object.entries(raw).map(([uid, profile]) => [uid, { ...(profile || {}), uid }])); renderConversations(); renderPeople(); updateChatHeader(); }, (error) => reportRealtimeError('member list', error));
+// Debounced save so rapid child events don't thrash localStorage
+let _saveUsersTimer = null;
+function saveUsersCache() {
+  clearTimeout(_saveUsersTimer);
+  _saveUsersTimer = setTimeout(() => {
+    try { localStorage.setItem('hangout-users', JSON.stringify(state.users)); } catch (e) {}
+  }, 500);
+}
+
+get(ref(db, 'users')).then((snapshot) => {
+  const raw = snapshot.val() || {};
+  state.users = Object.fromEntries(Object.entries(raw).map(([uid, profile]) => [uid, { ...(profile || {}), uid }]));
+  saveUsersCache(); // persist full list for next page load
+  renderConversations();
+  renderPeople();
+  updateChatHeader();
+
+  const usersRef = ref(db, 'users');
+  onChildChanged(usersRef, (childSnap) => {
+    const uid = childSnap.key;
+    state.users[uid] = { ...(childSnap.val() || {}), uid };
+    saveUsersCache();
+    renderConversations();
+    renderPeople();
+    updateChatHeader();
+  });
+  onChildAdded(usersRef, (childSnap) => {
+    const uid = childSnap.key;
+    if (!state.users[uid]) {
+      state.users[uid] = { ...(childSnap.val() || {}), uid };
+      saveUsersCache();
+      renderConversations();
+      renderPeople();
+    }
+  });
+  onChildRemoved(usersRef, (childSnap) => {
+    delete state.users[childSnap.key];
+    saveUsersCache();
+    renderConversations();
+    renderPeople();
+  });
+}).catch((error) => reportRealtimeError('member list', error));
 onValue(ref(db, 'presence'), (snapshot) => { state.online = snapshot.val() || {}; renderConversations(); renderPeople(); updateChatHeader(); }, (error) => reportRealtimeError('presence', error));
 onValue(ref(db, '.info/connected'), (snapshot) => { state.connected = snapshot.val() === true; if (state.connected) startOwnPresence(); });
 let checkedInvite = false;
 onAuthStateChanged(auth, async (user) => {
   const previousUser = state.user; if (previousUser && previousUser.uid !== user?.uid) stopOwnPresence(previousUser);
   state.user = user; if (state.stopInbox) state.stopInbox(); if (state.stopClears) state.stopClears(); if (state.stopPostsNotif) { state.stopPostsNotif(); state.stopPostsNotif = null; } stopThreadSummaryWatchers(); state.inbox = {}; state.clears = {}; state.inboxReady = false;
+  // Restore cached inbox immediately so the first render shows correct GC names & nicknames (no flicker)
+  if (user) {
+    try {
+      const cached = localStorage.getItem(`hangout-inbox-${user.uid}`);
+      if (cached) { state.inbox = JSON.parse(cached); renderConversations(); }
+    } catch (e) {}
+  }
   
   if (!checkedInvite) {
     const urlParams = new URLSearchParams(window.location.search);
@@ -1550,8 +1725,8 @@ onAuthStateChanged(auth, async (user) => {
     startOwnPresence();
     state.stopInbox = onValue(ref(db, `chatInboxes/${user.uid}`), handleInbox, (error) => reportRealtimeError('conversation list', error));
     state.stopClears = onValue(ref(db, `chatClears/${user.uid}`), (snapshot) => { state.clears = snapshot.val() || {}; if (state.activeThreadId) renderMessages(undefined, false); }, (error) => reportRealtimeError('message clears', error));
-    // Mirror Hangout Posts notification badge on the back button
-    state.stopPostsNotif = onValue(ref(db, `notifications/${user.uid}`), (snapshot) => {
+    // Mirror Hangout Posts notification badge on the back button (limited to latest 50)
+    state.stopPostsNotif = onValue(query(ref(db, `notifications/${user.uid}`), limitToLast(50)), (snapshot) => {
       const notifs = snapshot.val() || {};
       const unread = Object.values(notifs).filter(n => !n.read).length;
       const badge = $('back-notif-badge');
@@ -1957,6 +2132,35 @@ $('attach-game-item')?.addEventListener('click', () => {
 
 $('voice-rec-stop')?.addEventListener('click', stopVoiceRecording);
 $('voice-rec-cancel')?.addEventListener('click', cancelVoiceRecording);
+
+// ── Google Sign-In ──
+$('google-login-btn')?.addEventListener('click', async () => {
+  const error = $('auth-error'); error.classList.add('hidden');
+  const btn = $('google-login-btn'); const originalHtml = btn.innerHTML;
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  try {
+    const provider = new GoogleAuthProvider();
+    const result = await signInWithPopup(auth, provider);
+    // First-time Google users get a profile created from their Google account
+    const userSnap = await get(ref(db, `users/${result.user.uid}`));
+    if (!userSnap.exists()) {
+      const name = result.user.displayName || `User_${Math.floor(Math.random() * 999)}`;
+      const pic = result.user.photoURL || fallbackAvatar(result.user.uid);
+      await updateProfile(result.user, { displayName: name, photoURL: pic });
+      await update(ref(db, `users/${result.user.uid}`), { uid: result.user.uid, name, pic });
+    }
+    $('auth-dialog').close();
+  } catch (err) {
+    error.textContent = err.code === 'auth/account-exists-with-different-credential'
+      ? 'This email already has an account with a password. Sign in with email/password instead.'
+      : err.code === 'auth/popup-closed-by-user'
+        ? 'Google sign-in was closed before finishing.'
+        : err.code === 'auth/unauthorized-domain'
+          ? 'This domain is not authorized for Google sign-in.'
+          : err.message.replace('Firebase: ', '');
+    error.classList.remove('hidden');
+  } finally { btn.innerHTML = originalHtml; btn.disabled = false; }
+});
 
 $('voice-file-input')?.addEventListener('change', async (event) => {
   const file = event.target.files?.[0];

@@ -1,6 +1,32 @@
-import { db, fsdb } from "./firebase-config.js";
+import { db, fsdb, fsdb2, getPostDocRef, getFirestoreForPost, getRoundRobinFsdb, getFirestoreBySource } from "./firebase-config.js";
 import { ref, update, set, push, remove, increment, get, onValue } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 import { doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+
+const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
+window.escapeHtml = escapeHtml;
+
+window.formatLogPrizeBadges = (prize, lbPoints) => {
+    const badges = [];
+    if (prize) {
+        const str = String(prize).trim();
+        if (str.includes(' + Bonus: ') || str.startsWith('Bonus: ')) {
+            const parts = str.split(' + Bonus: ');
+            if (parts[0] && !parts[0].startsWith('Bonus: ')) {
+                badges.push(`<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30"><i class="fa-solid fa-gift text-emerald-500"></i> ${escapeHtml(parts[0])}</span>`);
+            }
+            const bonusPart = parts.length > 1 ? parts[1] : parts[0].replace(/^Bonus:\s*/, '');
+            if (bonusPart) {
+                badges.push(`<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-purple-500/10 dark:bg-purple-500/20 text-purple-700 dark:text-purple-300 border border-purple-500/30"><i class="fa-solid fa-wand-magic-sparkles text-purple-500"></i> Bonus: ${escapeHtml(bonusPart)}</span>`);
+            }
+        } else {
+            badges.push(`<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30"><i class="fa-solid fa-gift text-emerald-500"></i> ${escapeHtml(str)}</span>`);
+        }
+    }
+    if (lbPoints && Number(lbPoints) > 0) {
+        badges.push(`<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/30"><i class="fa-solid fa-trophy text-amber-500"></i> +${Number(lbPoints)} LB</span>`);
+    }
+    return badges.join('');
+};
 
 // Notifications
 window.updateNotifBadge = () => {
@@ -88,7 +114,6 @@ window.openProfile = (uid) => {
     window.postLimit = 15;
     window.hasMorePosts = true;
     if (window.listenPosts) window.listenPosts();
-    // Initial render will be handled by listenPosts response, but render the skeleton/header now:
     window.renderProfileData(true);
     window.scrollTo(0,0);
 };
@@ -107,12 +132,77 @@ window.goToPost = (postId) => {
     window.closeProfile(); 
     window.currentFilter = "All"; 
     window.isolatedPostId = postId;
+    window.isolatedPostData = window.allPosts.find(p => p.id === postId) 
+        || (window.globalPinnedPosts || []).find(p => p.id === postId) 
+        || (window.profilePinnedPosts || []).find(p => p.id === postId) 
+        || null;
+
+    if (window.isolatedPostUnsubscribe) {
+        window.isolatedPostUnsubscribe();
+        window.isolatedPostUnsubscribe = null;
+    }
+
+    const targetRef = getPostDocRef(postId);
+    window.isolatedPostUnsubscribe = onSnapshot(targetRef, (snapshot) => {
+        if (snapshot.exists()) {
+            const dbSource = snapshot.ref.firestore === fsdb2 ? 2 : 1;
+            const post = { id: snapshot.id, ...snapshot.data(), _dbSource: dbSource };
+            window._postDbMap.set(postId, dbSource);
+            window.isolatedPostData = post;
+            const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
+            if (existingIndex >= 0) {
+                window.allPosts[existingIndex] = post;
+            } else {
+                window.allPosts.push(post);
+            }
+
+            if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+                if (!window.usersReady) {
+                    window._pendingPostRender = true;
+                } else {
+                    window.renderFeed(false);
+                }
+            }
+        } else if (snapshot.ref.firestore === fsdb) {
+            if (window.isolatedPostUnsubscribe) window.isolatedPostUnsubscribe();
+            window.isolatedPostUnsubscribe = onSnapshot(doc(fsdb2, 'community_posts', postId), (snap2) => {
+                if (snap2.exists()) {
+                    const post = { id: snap2.id, ...snap2.data(), _dbSource: 2 };
+                    window._postDbMap.set(postId, 2);
+                    window.isolatedPostData = post;
+                    const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
+                    if (existingIndex >= 0) window.allPosts[existingIndex] = post;
+                    else window.allPosts.push(post);
+                    if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+                        if (!window.usersReady) window._pendingPostRender = true;
+                        else window.renderFeed(false);
+                    }
+                } else {
+                    const feed = document.getElementById('feed');
+                    if (feed) {
+                        feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
+                        <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
+                    }
+                }
+            });
+        } else {
+            const feed = document.getElementById('feed');
+            if (feed) {
+                feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
+                <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
+            }
+        }
+    }, (err) => {
+        console.error("Error fetching isolated post:", err);
+    });
+
     window.renderFeed(true);
     window.scrollTo(0,0);
 };
 
 window.clearIsolatedPost = () => {
     window.isolatedPostId = null;
+    window.isolatedPostData = null;
     window.feedRenderLimit = 15;
     if (window.isolatedPostUnsubscribe) {
         window.isolatedPostUnsubscribe();
@@ -184,6 +274,7 @@ window.openEditProfile = () => {
         });
     }
 
+    window.updateAdminButtons && window.updateAdminButtons();
     document.getElementById('profile-modal').classList.remove('hidden');
 };
 
@@ -192,14 +283,16 @@ window.renderPostList = (container, postsToRender, prefix, filterContext) => {
     const validIds = new Set(postsToRender.map(p => `post-${prefix}-${p.id}`));
     const banner = container.querySelector('#isolated-banner');
     
+    // Clean up loaders
+    container.querySelectorAll('#spotlight-loader, .sentinel-loader').forEach(el => el.remove());
+    
     Array.from(container.children).forEach(child => {
         if (child.id && child.id.startsWith(`post-${prefix}-`) && !validIds.has(child.id)) {
             container.removeChild(child);
+        } else if (child.id !== 'isolated-banner' && !child.id.startsWith(`post-${prefix}-`)) {
+            container.removeChild(child);
         }
     });
-
-    const sentinel = container.querySelector('.sentinel-loader');
-    if (sentinel) container.removeChild(sentinel);
 
     let prevNode = banner || null;
     
@@ -262,6 +355,10 @@ window.renderPostList = (container, postsToRender, prefix, filterContext) => {
 };
 
 window.renderFeed = (resetLimit = true) => {
+    if (!window.usersReady) {
+        window._pendingPostRender = true;
+        return;
+    }
     if(window.activeProfileUid) return; 
     const feed = document.getElementById('feed');
     const searchBarContainer = document.getElementById('search-bar-container');
@@ -270,54 +367,86 @@ window.renderFeed = (resetLimit = true) => {
     if (resetLimit) window.feedRenderLimit = 15;
     
     if (window.isolatedPostId) {
-        const singlePost = window.allPosts.find(p => p.id === window.isolatedPostId);
+        const singlePost = window.isolatedPostData || window.allPosts.find(p => p.id === window.isolatedPostId);
         searchBarContainer.classList.add('hidden');
         catFilters.classList.add('hidden');
 
         if (!singlePost) {
-            feed.innerHTML = `<div class="text-center text-gray-500 py-10">
-                <i class="fa-solid fa-spinner fa-spin text-2xl mb-2 text-blue-600"></i>
-                <p>Loading spotlight post...</p>
-            </div>`;
-            if (window.isolatedPostUnsubscribe) window.isolatedPostUnsubscribe();
-            
-            window.isolatedPostUnsubscribe = onSnapshot(doc(fsdb, 'community_posts', window.isolatedPostId), (snapshot) => {
-                if (snapshot.exists()) {
-                    const post = { id: snapshot.id, ...snapshot.data() };
-                    
-                    const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
-                    if (existingIndex >= 0) {
-                        window.allPosts[existingIndex] = post;
-                    } else {
-                        window.allPosts.push(post);
-                    }
-
-                    if (!window.isUserTyping && !window._bingoGlobalSpinning) {
-                        if (!window.usersReady) {
-                            window._pendingPostRender = true;
+            let loader = feed.querySelector('#spotlight-loader');
+            if (!loader) {
+                feed.innerHTML = `<div id="spotlight-loader" class="text-center text-gray-500 py-10">
+                    <i class="fa-solid fa-spinner fa-spin text-2xl mb-2 text-blue-600"></i>
+                    <p>Loading spotlight post...</p>
+                </div>`;
+            }
+            if (!window.isolatedPostUnsubscribe) {
+                const targetRef = getPostDocRef(window.isolatedPostId);
+                window.isolatedPostUnsubscribe = onSnapshot(targetRef, (snapshot) => {
+                    if (snapshot.exists()) {
+                        const dbSource = snapshot.ref.firestore === fsdb2 ? 2 : 1;
+                        const post = { id: snapshot.id, ...snapshot.data(), _dbSource: dbSource };
+                        window._postDbMap.set(window.isolatedPostId, dbSource);
+                        window.isolatedPostData = post;
+                        const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
+                        if (existingIndex >= 0) {
+                            window.allPosts[existingIndex] = post;
                         } else {
-                            window.renderFeed(false);
+                            window.allPosts.push(post);
                         }
+
+                        if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+                            if (!window.usersReady) {
+                                window._pendingPostRender = true;
+                            } else {
+                                window.renderFeed(false);
+                            }
+                        }
+                    } else if (snapshot.ref.firestore === fsdb) {
+                        if (window.isolatedPostUnsubscribe) window.isolatedPostUnsubscribe();
+                        window.isolatedPostUnsubscribe = onSnapshot(doc(fsdb2, 'community_posts', window.isolatedPostId), (snap2) => {
+                            if (snap2.exists()) {
+                                const post = { id: snap2.id, ...snap2.data(), _dbSource: 2 };
+                                window._postDbMap.set(window.isolatedPostId, 2);
+                                window.isolatedPostData = post;
+                                const existingIndex = window.allPosts.findIndex(p => p.id === post.id);
+                                if (existingIndex >= 0) window.allPosts[existingIndex] = post;
+                                else window.allPosts.push(post);
+                                if (!window.isUserTyping && !window._bingoGlobalSpinning) {
+                                    if (!window.usersReady) window._pendingPostRender = true;
+                                    else window.renderFeed(false);
+                                }
+                            } else {
+                                feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
+                                <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
+                            }
+                        });
+                    } else {
+                        feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
+                        <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
                     }
-                } else {
-                    feed.innerHTML = `<p class="text-center text-gray-500 py-10">Post not found or deleted.</p>
+                }, (err) => {
+                    console.error("Error fetching isolated post:", err);
+                    feed.innerHTML = `<p class="text-center text-gray-500 py-10">Failed to load post.</p>
                     <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
-                }
-            }, (err) => {
-                console.error("Error fetching isolated post:", err);
-                feed.innerHTML = `<p class="text-center text-gray-500 py-10">Failed to load post.</p>
-                <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-full mx-auto block mt-2 shadow-sm transition">Back to Feed</button>`;
-            });
+                });
+            }
             return;
         }
 
+        feed.querySelectorAll('#spotlight-loader').forEach(el => el.remove());
+
         const bannerId = 'isolated-banner';
         let banner = document.getElementById(bannerId);
-        if(!banner) {
-            feed.innerHTML = `<div id="${bannerId}" class="bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 p-3 rounded-xl mb-3 flex items-center justify-between shadow-sm border border-blue-100 dark:border-blue-800/50">
+        if (!banner) {
+            const bannerEl = document.createElement('div');
+            bannerEl.id = bannerId;
+            bannerEl.className = 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 p-3 rounded-xl mb-3 flex items-center justify-between shadow-sm border border-blue-100 dark:border-blue-800/50';
+            bannerEl.innerHTML = `
                 <span class="text-sm font-bold"><i class="fa-solid fa-magnifying-glass mr-2"></i>Post Spotlight ✨</span>
                 <button onclick="window.clearIsolatedPost()" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1.5 rounded-full text-xs font-bold shadow-sm transition">Back to Feed</button>
-            </div>`;
+            `;
+            if (feed.firstChild) feed.insertBefore(bannerEl, feed.firstChild);
+            else feed.appendChild(bannerEl);
         }
 
         // Guard against the race condition: don't render if users cache isn't loaded yet
@@ -409,6 +538,9 @@ window.renderFeed = (resetLimit = true) => {
     
     window.renderPostList(feed, postsToRender, 'main', window.currentFilter);
 
+    // Clean up any existing loaders or catchup messages first
+    feed.querySelectorAll('.sentinel-loader, .end-message-catchup').forEach(el => el.remove());
+
     if (window.feedRenderLimit < window.filteredPostsLength || window.hasMorePosts) {
         const sentinel = document.createElement('div');
         sentinel.className = 'sentinel-loader w-full flex items-center justify-center text-blue-500 font-bold text-sm py-4 animate-pulse';
@@ -428,10 +560,6 @@ window.renderFeed = (resetLimit = true) => {
         }, { rootMargin: "300px" });
         window.feedObserver.observe(sentinel);
     } else if (displayPosts.length > 0) {
-        // Prevent multiple end messages from stacking if feed is not wiped
-        const existingMsg = feed.querySelector('.end-message-catchup');
-        if (existingMsg) existingMsg.remove();
-        
         const endMessage = document.createElement('div');
         endMessage.className = 'w-full text-center text-gray-400 dark:text-gray-500 text-xs py-4 font-semibold end-message-catchup';
         endMessage.innerHTML = '<i class="fa-solid fa-check-circle mr-1"></i> You caught up! No more posts.';
@@ -456,6 +584,10 @@ window.renderFeed = (resetLimit = true) => {
 };
 
 window.renderProfileData = (resetLimit = true) => {
+    if (!window.usersReady) {
+        window._pendingPostRender = true;
+        return;
+    }
     if(!window.activeProfileUid) return;
     const uData = window.globalUsersCache[window.activeProfileUid] || { name: "Unknown User", pic: window.generateAvatar(window.activeProfileUid), points: 0 };
     const role = window.getRole(window.activeProfileUid);
@@ -491,9 +623,12 @@ window.renderProfileData = (resetLimit = true) => {
         pokeStats += `<p id="personal-poke-stats" class="text-[10px] text-gray-400 mt-0.5">Loading your pokes...</p>`;
         
         get(ref(db, `users/${window.activeProfileUid}/pokesFrom/${window.currentUser.uid}`)).then(snap => {
-            const pokes = snap.val()?.count || 0;
+            const d = snap.val();
+            const pokedToday = d && d.lastPokedDate === new Date().toLocaleDateString();
+            const used = pokedToday ? Number(d.count || 0) : 0;
+            const limit = Number(window.siteSettings.pokeLimit ?? 3);
             const el = document.getElementById('personal-poke-stats');
-            if(el) el.innerHTML = `You poked them: <span class="font-bold text-orange-400">${pokes} times</span>`;
+            if(el) el.innerHTML = `Poked today: <span class="font-bold text-orange-400">${used}${limit > 0 ? ' / ' + limit : ''}</span>`;
         }).catch(err => console.error("Error fetching pokes:", err));
     }
 
@@ -606,6 +741,9 @@ window.renderProfileData = (resetLimit = true) => {
     const postsToRender = pPosts.slice(0, window.profileRenderLimit);
     window.renderPostList(pFeed, postsToRender, 'profile', 'profile');
 
+    // Clean up any existing loaders or catchup messages first
+    pFeed.querySelectorAll('.sentinel-loader, .end-message-catchup').forEach(el => el.remove());
+
     if (window.profileRenderLimit < pPosts.length || window.hasMorePosts) {
         const sentinel = document.createElement('div');
         sentinel.className = 'sentinel-loader w-full flex items-center justify-center text-blue-500 font-bold text-sm py-4 animate-pulse';
@@ -626,7 +764,7 @@ window.renderProfileData = (resetLimit = true) => {
         window.profileObserver.observe(sentinel);
     } else if (pPosts.length > 0) {
         const endMessage = document.createElement('div');
-        endMessage.className = 'w-full text-center text-gray-400 dark:text-gray-500 text-xs py-4 font-semibold';
+        endMessage.className = 'w-full text-center text-gray-400 dark:text-gray-500 text-xs py-4 font-semibold end-message-catchup';
         endMessage.innerHTML = '<i class="fa-solid fa-check-circle mr-1"></i> You caught up! No more posts.';
         pFeed.appendChild(endMessage);
     }
@@ -1005,10 +1143,43 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 </button>
             </div>`;
     } else if (post.isGame) {
-        let prizeText = '';
-        if (post.gamePrize) prizeText += `PRIZE: ${post.gamePrize}`;
-        if (post.gameLbPoints) prizeText += (prizeText ? ' + ' : '') + `${post.gameLbPoints} LB Points`;
-        const prizeStr = prizeText ? `<div class="bg-gradient-to-r from-purple-500 to-pink-500 text-white text-center py-1.5 px-3 rounded-lg text-xs font-bold shadow-sm mb-2"><i class="fa-solid fa-gift mr-1"></i> ${prizeText}</div>` : '';
+        const badges = [];
+
+        // 1. Gift Icon: Prize Amount (PHP)
+        let numPrize = 0;
+        let isLegacyTextPrize = false;
+        if (post.gamePrize !== undefined && post.gamePrize !== null && post.gamePrize !== '') {
+            if (typeof post.gamePrize === 'number') {
+                numPrize = post.gamePrize;
+            } else {
+                const str = String(post.gamePrize).trim();
+                const parsed = parseFloat(str.replace(/^PHP\s*/i, ''));
+                if (!isNaN(parsed) && parsed > 0 && (str === String(parsed) || str.toUpperCase() === `PHP ${parsed}` || str.toUpperCase() === `PHP${parsed}`)) {
+                    numPrize = parsed;
+                } else if (str && str !== '0') {
+                    isLegacyTextPrize = true;
+                }
+            }
+        }
+        if (numPrize > 0) {
+            badges.push(`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 backdrop-blur-sm shadow-sm"><i class="fa-solid fa-gift text-emerald-500 text-xs"></i> PHP ${numPrize.toLocaleString()}</span>`);
+        } else if (isLegacyTextPrize && post.gamePrize) {
+            badges.push(`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 backdrop-blur-sm shadow-sm"><i class="fa-solid fa-gift text-emerald-500 text-xs"></i> ${escapeHtml(String(post.gamePrize))}</span>`);
+        }
+
+        // 2. Trophy Icon: LB Points
+        const lb = (post.gameLbPoints !== undefined && post.gameLbPoints !== null) ? Number(post.gameLbPoints) : 0;
+        if (lb > 0) {
+            badges.push(`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/10 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 backdrop-blur-sm shadow-sm"><i class="fa-solid fa-trophy text-amber-500 text-xs"></i> +${lb} LB Points</span>`);
+        }
+
+        // 3. Magic Icon: Bonus Prize
+        const bonus = (post.gameBonusPrize || post.gameBonus || '').trim();
+        if (bonus) {
+            badges.push(`<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-purple-500/10 dark:bg-purple-500/20 text-purple-700 dark:text-purple-300 border border-purple-500/30 backdrop-blur-sm shadow-sm"><i class="fa-solid fa-wand-magic-sparkles text-purple-500 text-xs"></i> Bonus: ${escapeHtml(bonus)}</span>`);
+        }
+
+        const prizeStr = badges.length ? `<div class="flex flex-wrap items-center justify-center gap-2 mb-3">${badges.join('')}</div>` : '';
         
         if (post.gameType === 'first_to_mine') {
             if (post.gameStatus === 'active') {
@@ -1022,7 +1193,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 gameHtml = `
                     <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-80">
                         ${prizeStr}
-                        <div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} mined it first!</div>
+                        <div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} mined it first!</span></div>
                     </div>`;
             }
         } else if (post.gameType === 'last_comment') {
@@ -1045,10 +1216,10 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             } else {
                 let outcomeHtml = '';
                 if (post.gameWinner === 'none' || !post.gameWinner) {
-                    outcomeHtml = `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-xmark mr-1"></i> Game forfeited! (No winners)</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-xmark"></i> Game forfeited! (No winners)</div>`;
                 } else {
                     const winnerName = window.globalUsersCache[post.gameWinner]?.name || "Someone";
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} won the Last Comment!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} won the Last Comment!</span></div>`;
                 }
                 gameHtml = `
                     <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-80">
@@ -1081,10 +1252,10 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             } else {
                 let outcomeHtml = '';
                 if (post.gameWinner === 'none') {
-                    outcomeHtml = `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-xmark mr-1"></i> @${targetUserName} failed the challenge!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-xmark"></i> @${targetUserName} failed the challenge!</div>`;
                 } else {
                     const winnerName = window.globalUsersCache[post.gameWinner]?.name || post.gameWinner;
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-trophy mr-1"></i> Challenge Completed by ${winnerName}!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-trophy text-amber-400"></i> <span>Challenge Completed by ${winnerName}!</span></div>`;
                 }
                 gameHtml = `
                     <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-80">
@@ -1112,10 +1283,10 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             } else {
                 let outcomeHtml = '';
                 if (post.gameWinner === 'none') {
-                    outcomeHtml = `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-xmark mr-1"></i> @${targetUserName} failed the challenge!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-xmark"></i> @${targetUserName} failed the challenge!</div>`;
                 } else {
                     const winnerName = window.globalUsersCache[post.gameWinner]?.name || post.gameWinner;
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} mined it!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} mined it!</span></div>`;
                 }
                 gameHtml = `
                     <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-80">
@@ -1139,7 +1310,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 } else {
                     // bring_me_emoji: show the NAME to all (players send the emoji CHAR)
                     // Host can see the answer emoji char
-                    displayContent = `<div class="text-2xl font-bold text-blue-700 dark:text-blue-300 mb-2">${post.gameEmojiName || 'Emoji'}</div>`;
+                    displayContent = `<div class="text-2xl font-bold text-blue-700 dark:text-blue-300 mb-2 text-center">${post.gameEmojiName || 'Emoji'}</div>`;
                     gameTitle = 'Find and send this emoji!';
                     if (isHost) hostHint = `<div class="text-xs text-yellow-600 dark:text-yellow-400 font-bold mt-1 bg-yellow-50 dark:bg-yellow-900/20 px-3 py-1 rounded-full">🔑 Answer: ${post.gameEmojiChar || '(no char stored)'}</div>`;
                     answerHint = `<p class="text-xs text-gray-400 mt-1">Paste or type the emoji character</p>`;
@@ -1158,10 +1329,10 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 const revealedChar = post.gameEmojiChar || '';
                 let outcomeHtml = '';
                 if (post.gameWinner === 'none') {
-                    outcomeHtml = `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-xmark mr-1"></i> No one guessed it!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-xmark"></i> No one guessed it!</div>`;
                 } else {
                     const winnerName = window.globalUsersCache[post.gameWinner]?.name || post.gameWinner;
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} won!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} won!</span></div>`;
                 }
                 gameHtml = `
                     <div class="mt-3 mb-2 p-3 bg-gray-50 dark:bg-slate-900/50 rounded-xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-80">
@@ -1170,7 +1341,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                         ${outcomeHtml}
                     </div>`;
             }
-        } else if (['flags', 'math', 'jumbled_words', 'trivia'].includes(post.gameType)) {
+        } else if (['flags', 'math', 'jumbled_words', 'trivia', 'periodic_table'].includes(post.gameType)) {
             const isHost = window.currentUser && window.currentUser.uid === post.authorId;
             let displayContent = '', gameTitle = '', hostHint = '', answerHint = '';
             let timerHtml = '';
@@ -1187,6 +1358,28 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 gameTitle = 'What country does this flag belong to?';
                 if (isHost) hostHint = `<div class="text-xs text-yellow-600 dark:text-yellow-400 font-bold mt-1 bg-yellow-50 dark:bg-yellow-900/20 px-3 py-1 rounded-full">🔑 Answer: ${post.gameFlagName}</div>`;
                 answerHint = `<p class="text-xs text-gray-400 mt-1">Type the country name, e.g. "France"</p>`;
+            } else if (post.gameType === 'periodic_table') {
+                const isNameMode = post.gameElementGuessMode === 'name';
+                if (isNameMode) {
+                    displayContent = `
+                        <div class="p-3 bg-gradient-to-br from-cyan-500 to-blue-600 text-white rounded-2xl shadow-md flex flex-col items-center justify-between w-24 h-24 mb-2 border-2 border-cyan-300">
+                            <span class="text-[10px] font-mono font-bold opacity-80 self-start">#${post.gameElementNumber || ''}</span>
+                            <span class="text-3xl font-black tracking-wider leading-none">${post.gameElementSymbol || ''}</span>
+                            <span class="text-[10px] font-semibold opacity-90">?</span>
+                        </div>`;
+                    gameTitle = 'Guess the Element Name!';
+                    answerHint = `<p class="text-xs text-gray-400 mt-1">Type the element name (e.g. "Iron", "Gold")</p>`;
+                } else {
+                    displayContent = `
+                        <div class="p-3 bg-gradient-to-br from-cyan-500 to-blue-600 text-white rounded-2xl shadow-md flex flex-col items-center justify-between w-24 h-24 mb-2 border-2 border-cyan-300">
+                            <span class="text-[10px] font-mono font-bold opacity-80 self-start">#${post.gameElementNumber || ''}</span>
+                            <span class="text-2xl font-black tracking-wider leading-none">?</span>
+                            <span class="text-[10px] font-bold opacity-90 text-center truncate w-full">${post.gameElementName || ''}</span>
+                        </div>`;
+                    gameTitle = 'Guess the Chemical Symbol!';
+                    answerHint = `<p class="text-xs text-gray-400 mt-1">Type the symbol (e.g. "Fe", "Au")</p>`;
+                }
+                if (isHost) hostHint = `<div class="text-xs text-yellow-600 dark:text-yellow-400 font-bold mt-1 bg-yellow-50 dark:bg-yellow-900/20 px-3 py-1 rounded-full">🔑 Answer: ${post.gameElementAnswer} ([#${post.gameElementNumber}] ${post.gameElementSymbol} - ${post.gameElementName})</div>`;
             } else if (post.gameType === 'math') {
                 // Only append "= ?" if the question doesn't already contain it (algebra questions include it)
                 const mathDisplay = post.gameMathQuestion.includes('=') 
@@ -1222,16 +1415,24 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             } else {
                 let outcomeHtml = '';
                 if (post.gameWinner === 'none') {
-                    outcomeHtml = `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-xmark mr-1"></i> No one got it in time!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-xmark"></i> No one got it in time!</div>`;
                 } else {
                     const winnerName = window.globalUsersCache[post.gameWinner]?.name || post.gameWinner;
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} won!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} won!</span></div>`;
                 }
                 
                 let answerReveal = '';
                 if (post.gameType === 'flags') {
                     const flagImgSrc = post.gameFlagCode ? `https://flagcdn.com/w80/${post.gameFlagCode}.png` : '';
                     answerReveal = `<div class="flex flex-col items-center mb-1">${flagImgSrc ? `<img src="${flagImgSrc}" class="h-12 rounded shadow mb-1 border border-gray-200" alt="Flag">` : ''}<span class="font-bold">${post.gameFlagName}</span></div>`;
+                }
+                else if (post.gameType === 'periodic_table') {
+                    answerReveal = `
+                        <div class="flex flex-col items-center mb-1">
+                            <div class="px-3 py-1.5 bg-cyan-100 dark:bg-cyan-900/40 text-cyan-900 dark:text-cyan-200 rounded-lg font-mono font-bold text-sm mb-1 border border-cyan-300 dark:border-cyan-800">
+                                [#${post.gameElementNumber}] <strong>${post.gameElementSymbol}</strong> — ${post.gameElementName}
+                            </div>
+                        </div>`;
                 }
                 else if (post.gameType === 'math') answerReveal = `<div class="text-xl mb-1">${post.gameMathQuestion} = <strong>${post.gameMathAnswer}</strong></div>`;
                 else if (post.gameType === 'jumbled_words') answerReveal = `<div class="text-lg mb-1">${post.gameJumbledScrambled} ➔ <strong>${post.gameJumbledOriginal}</strong></div>`;
@@ -1341,6 +1542,13 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 : [];
             const hasJoined = window.currentUser ? joinedArray.some(u => u.uid === window.currentUser.uid) : false;
             const entryCount = joinedArray.length;
+            const prizes = Array.isArray(post.spinNamesPrizes) ? post.spinNamesPrizes : [];
+            let prizesBadges = '';
+            if (prizes.length > 0) {
+                prizesBadges = prizes.map(pz => {
+                    return `<span class="inline-flex items-center gap-1 bg-amber-500/10 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 text-[11px] font-bold px-2.5 py-0.5 rounded-full"><i class="fa-solid fa-trophy text-amber-500"></i>Spin #${pz.target}: ${escapeHtml(pz.prize || '')}</span>`;
+                }).join(' ');
+            }
             
             const animatingItem = (post.spinNamesLastSpin && Date.now() - post.spinNamesLastSpin.startTime < 4000) ? post.spinNamesLastSpin.item : null;
             const winnersList = Array.isArray(post.spinNamesWinners) ? post.spinNamesWinners : [];
@@ -1350,6 +1558,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-slate-800 dark:to-slate-800 rounded-xl border-2 border-blue-200 dark:border-blue-900/50 flex flex-col items-center">
                         <h4 class="font-black text-blue-800 dark:text-blue-200 text-lg mb-1">🎡 Spin the Names!</h4>
                         <p class="text-xs text-gray-600 dark:text-gray-300 mb-2">Join the draw for a chance to win.</p>
+                        ${prizesBadges ? `<div class="flex flex-wrap gap-1.5 justify-center mb-2">${prizesBadges}</div>` : ''}
                         <p class="text-xs text-gray-400 mb-2"><i class="fa-solid fa-users mr-1"></i>${entryCount} players joined</p>
                         ${hasJoined 
                             ? `<div class="text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 px-3 py-1 rounded-full font-bold mb-2"><i class="fa-solid fa-check mr-1"></i>You joined!</div>`
@@ -1371,8 +1580,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 
                 let historyHtml = displayHistory.length > 0
                     ? displayHistory.map(s => s.prize
-                        ? `<div class="text-[10px] bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800/40 rounded px-2 py-1 shadow-sm mb-1"><i class="fa-solid fa-trophy text-yellow-500 mr-1"></i>Spin #${s.spinNumber}: <strong>${s.name}</strong> — ${s.prize}</div>`
-                        : `<div class="text-[10px] bg-white dark:bg-slate-700 rounded px-2 py-1 shadow-sm mb-1 text-gray-500 dark:text-gray-400"><i class="fa-solid fa-rotate-right mr-1"></i>Spin #${s.spinNumber}: <strong>${s.name}</strong> — <span class="italic">No prize</span></div>`
+                        ? `<div class="text-[10px] bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800/40 rounded px-2.5 py-1 shadow-sm mb-1"><i class="fa-solid fa-trophy text-yellow-500 mr-1"></i>Spin #${s.spinNumber}: <strong>${escapeHtml(s.name)}</strong> — ${escapeHtml(s.prize)}</div>`
+                        : `<div class="text-[10px] bg-white dark:bg-slate-700 rounded px-2.5 py-1 shadow-sm mb-1 text-gray-500 dark:text-gray-400"><i class="fa-solid fa-rotate-right mr-1"></i>Spin #${s.spinNumber}: <strong>${escapeHtml(s.name)}</strong> — <span class="italic">No prize</span></div>`
                     ).join('')
                     : `<span class="text-xs text-gray-400">None yet</span>`;
                     
@@ -1380,6 +1589,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-slate-800 dark:to-slate-800 rounded-xl border-2 border-indigo-300 dark:border-indigo-900/50 flex flex-col items-center overflow-hidden">
                         <h4 class="font-black text-indigo-800 dark:text-indigo-200 text-base mb-1">🎡 Draw in Progress!</h4>
                         <p class="text-xs text-gray-500 mb-2"><i class="fa-solid fa-users mr-1"></i>${entryCount} players · Spin #${currentSpinNum}</p>
+                        ${prizesBadges ? `<div class="flex flex-wrap gap-1.5 justify-center mb-2">${prizesBadges}</div>` : ''}
                         
                         <div class="relative my-3 transform transition-all duration-300 ${canvasClass}">
                             <div class="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1 z-10 text-red-500 text-2xl leading-none drop-shadow-md">▼</div>
@@ -1403,13 +1613,13 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 let resultsHtml;
                 if (fullHistory.length > 0) {
                     resultsHtml = fullHistory.map(s => s.prize
-                        ? `<div class="bg-indigo-100 dark:bg-indigo-900/30 text-indigo-800 dark:text-indigo-300 text-xs font-bold px-3 py-2 rounded mb-1 shadow-sm"><i class="fa-solid fa-trophy mr-1 text-yellow-500"></i>Spin #${s.spinNumber}: <strong>${s.name}</strong> won ${s.prize}!</div>`
-                        : `<div class="bg-gray-100 dark:bg-slate-800 text-gray-500 dark:text-gray-400 text-xs px-3 py-2 rounded mb-1"><i class="fa-solid fa-rotate-right mr-1"></i>Spin #${s.spinNumber}: <strong>${s.name}</strong> — <span class="italic">No prize</span></div>`
+                        ? `<div class="inline-flex items-center gap-1.5 bg-indigo-500/10 dark:bg-indigo-500/20 text-indigo-800 dark:text-indigo-300 text-xs font-semibold px-3 py-1.5 rounded-full mb-1.5 shadow-sm border border-indigo-500/20"><i class="fa-solid fa-trophy text-yellow-500"></i><span>Spin #${s.spinNumber}: <strong>${escapeHtml(s.name)}</strong> won ${escapeHtml(s.prize)}!</span></div>`
+                        : `<div class="inline-flex items-center gap-1.5 bg-gray-100 dark:bg-slate-800 text-gray-500 dark:text-gray-400 text-xs px-3 py-1 rounded-full mb-1"><i class="fa-solid fa-rotate-right mr-1"></i>Spin #${s.spinNumber}: <strong>${escapeHtml(s.name)}</strong> — <span class="italic">No prize</span></div>`
                     ).join('');
                 } else {
                     // Fallback for old games that don't have spinNamesSpinHistory yet
                     resultsHtml = winnersList.length > 0
-                        ? winnersList.map(w => `<div class="bg-indigo-100 dark:bg-indigo-900/30 text-indigo-800 dark:text-indigo-300 text-xs font-bold px-3 py-2 rounded mb-1 shadow-sm"><i class="fa-solid fa-trophy mr-1 text-yellow-500"></i>Spin #${w.target}: <strong>${w.name}</strong> won ${w.prize}!</div>`).join('')
+                        ? winnersList.map(w => `<div class="inline-flex items-center gap-1.5 bg-indigo-500/10 dark:bg-indigo-500/20 text-indigo-800 dark:text-indigo-300 text-xs font-semibold px-3 py-1.5 rounded-full mb-1.5 shadow-sm border border-indigo-500/20"><i class="fa-solid fa-trophy text-yellow-500"></i><span>Spin #${w.target}: <strong>${escapeHtml(w.name)}</strong> won ${escapeHtml(w.prize)}!</span></div>`).join('')
                         : `<div class="bg-gray-100 dark:bg-gray-800 text-gray-500 text-xs font-bold px-3 py-2 rounded">No winners.</div>`;
                 }
                     
@@ -1427,9 +1637,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                 <div class="mt-3 mb-2 p-4 bg-gradient-to-r from-pink-100 to-rose-100 dark:from-pink-900/40 dark:to-rose-900/40 rounded-xl border-2 border-pink-300 dark:border-pink-700/50 flex flex-col items-center text-center shadow-sm">
                     <div class="text-3xl mb-2">🎁</div>
                     <h4 class="font-black text-pink-800 dark:text-pink-300 text-lg mb-1">ncl @${winnerName}</h4>
-                    <div class="mt-2 bg-white dark:bg-slate-800/80 px-4 py-2 rounded-lg font-bold text-pink-600 dark:text-pink-400 shadow-inner text-sm">
-                        ${post.gamePrize}
-                    </div>
+                    ${prizeStr ? `<div class="mt-2">${prizeStr}</div>` : (post.gamePrize ? `<div class="mt-2 bg-white dark:bg-slate-800/80 px-4 py-2 rounded-lg font-bold text-pink-600 dark:text-pink-400 shadow-inner text-sm">${escapeHtml(String(post.gamePrize))}</div>` : '')}
                 </div>`;
         } else if (post.gameType === 'count_dots') {
             if (post.gameStatus === 'active') {
@@ -1455,8 +1663,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone')
                     : 'No one';
                 const outcomeHtml = post.gameWinner && post.gameWinner !== 'none'
-                    ? `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} guessed correctly!</div>`
-                    : `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-xmark mr-1"></i> Game ended! No correct guess.</div>`;
+                    ? `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} guessed correctly!</span></div>`
+                    : `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-xmark"></i> Game ended! No correct guess.</div>`;
 
                 gameHtml = `
                     <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
@@ -1547,11 +1755,11 @@ window.generatePostHTML = function(post, prefix, filterContext) {
             } else {
                 let outcomeHtml = '';
                 if (post.gameWinner === 'draw') {
-                    outcomeHtml = `<div class="bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-handshake mr-1"></i> Match ended in a Draw!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-amber-500/15 text-amber-800 dark:text-amber-300 border border-amber-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-handshake"></i> Match ended in a Draw!</div>`;
                 } else {
                     const winnerName = post.gameWinner ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone') : 'Someone';
                     const winnerSymbol = post.gameWinner === playerX ? '❌' : '⭕';
-                    outcomeHtml = `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerSymbol} ${winnerName} won the match!</div>`;
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerSymbol} ${winnerName} won the match!</span></div>`;
                 }
 
                 const gridSize = Number(post.tictactoeGridSize) || (board.length === 16 ? 4 : 3);
@@ -1573,6 +1781,283 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
                         ${prizeStr}
                         <h4 class="font-black text-gray-700 dark:text-gray-300 text-base mb-1">⚔️ Tic Tac Toe Ended</h4>
+                        ${gridHtml}
+                        ${outcomeHtml}
+                    </div>`;
+            }
+        } else if (post.gameType === 'four_in_a_row') {
+            const isHost = window.currentUser && window.currentUser.uid === post.authorId;
+            const count = Number(post.fourPlayerCount) || 2;
+            const playerR = post.fourPlayerR;
+            const playerB = post.fourPlayerB;
+            const playerY = post.fourPlayerY;
+            const nameR = (playerR ? (window.globalUsersCache[playerR]?.name || 'Host') : 'Host');
+            const nameB = (playerB ? (window.globalUsersCache[playerB]?.name || 'Challenger 1') : (post.fourTargetUser ? (window.globalUsersCache[post.fourTargetUser]?.name || 'Challenger 1') : 'Waiting...'));
+            const nameY = (playerY ? (window.globalUsersCache[playerY]?.name || 'Challenger 2') : 'Waiting...');
+            const isTargeted = Boolean(post.fourTargetUser);
+            const myUid = window.currentUser ? window.currentUser.uid : null;
+            const isAlreadyIn = myUid && (myUid === playerR || myUid === playerB || myUid === playerY);
+            const isEligibleChallenger = myUid && !isAlreadyIn && (!isTargeted || post.fourTargetUser === myUid || (count === 3 && playerB && !playerY));
+
+            const board = post.fourBoard || Array(49).fill('');
+            const turn = post.fourTurn || 'R';
+            const isMyTurn = myUid && (
+                (turn === 'R' && myUid === playerR) ||
+                (turn === 'B' && myUid === playerB) ||
+                (turn === 'Y' && myUid === playerY)
+            );
+
+            if (post.gameStatus === 'active') {
+                if (post.fourStatus === 'waiting') {
+                    const acceptBtn = isEligibleChallenger ? `
+                        <button onclick="window.acceptFourInARowChallenge('${post.id}')" class="mt-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black py-2.5 px-8 rounded-full shadow-lg transform transition hover:scale-105 active:scale-95 animate-pulse text-sm">
+                            <i class="fa-solid fa-circle-dot mr-2"></i>Accept Challenge & Join!
+                        </button>` : (isHost ? `<div class="mt-2 text-xs text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-slate-700 px-3 py-1 rounded-full">Waiting for challenger(s) to accept...</div>` : `<div class="mt-2 text-xs text-gray-400">Waiting for players to join...</div>`);
+
+                    const playersBadges = count === 3 ? `
+                        <div class="flex flex-wrap items-center justify-center gap-2 my-2 text-xs font-bold">
+                            <span class="bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300 px-2.5 py-1 rounded-full">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 px-2.5 py-1 rounded-full">🔵 ${playerB ? `@${escapeHtml(nameB)}` : 'Open Slot'}</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 px-2.5 py-1 rounded-full">🟡 ${playerY ? `@${escapeHtml(nameY)}` : 'Open Slot'}</span>
+                        </div>` : `
+                        <div class="flex items-center gap-3 my-2 text-xs font-bold">
+                            <span class="bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300 px-3 py-1 rounded-full">🔴 @${escapeHtml(nameR)} (Host)</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 px-3 py-1 rounded-full">🔵 ${isTargeted ? `@${escapeHtml(nameB)}` : 'Open Challenger'}</span>
+                        </div>`;
+
+                    gameHtml = `
+                        <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-slate-800 dark:to-slate-800 rounded-2xl border-2 border-blue-200 dark:border-blue-900/50 flex flex-col items-center">
+                            ${prizeStr}
+                            <h4 class="font-black text-blue-900 dark:text-blue-200 text-base mb-1">🔴🔵 4 in a Row (7x7)</h4>
+                            ${playersBadges}
+                            ${acceptBtn}
+                        </div>`;
+                } else {
+                    const turnName = (turn === 'R' ? nameR : (turn === 'B' ? nameB : nameY));
+                    const turnColor = turn === 'R' ? 'Red 🔴' : (turn === 'B' ? 'Blue 🔵' : 'Yellow 🟡');
+                    const turnBadge = isMyTurn
+                        ? `<div class="bg-blue-600 text-white font-extrabold px-4 py-1.5 rounded-full text-xs animate-bounce shadow"><i class="fa-solid fa-play mr-1"></i>YOUR TURN (${turnColor})!</div>`
+                        : `<div class="bg-gray-100 dark:bg-slate-700 text-gray-700 dark:text-gray-300 font-bold px-3 py-1 rounded-full text-xs">Waiting for @${escapeHtml(turnName)} (${turnColor})'s move...</div>`;
+
+                    const playersBadges = count === 3 ? `
+                        <div class="flex flex-wrap items-center justify-between w-full max-w-xs text-xs font-bold mb-2">
+                            <span class="text-rose-600 dark:text-rose-400">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-blue-600 dark:text-blue-400">🔵 @${escapeHtml(nameB)}</span>
+                            <span class="text-amber-600 dark:text-amber-400">🟡 @${escapeHtml(nameY)}</span>
+                        </div>` : `
+                        <div class="flex items-center justify-between w-full max-w-xs text-xs font-bold mb-2">
+                            <span class="text-rose-600 dark:text-rose-400">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-gray-400">VS</span>
+                            <span class="text-blue-600 dark:text-blue-400">🔵 @${escapeHtml(nameB)}</span>
+                        </div>`;
+
+                    let gridHtml = `<div class="grid grid-cols-7 grid-rows-7 gap-1 p-2 bg-blue-900/15 dark:bg-slate-900/90 rounded-2xl border-2 border-blue-400 dark:border-slate-700 shadow-inner w-72 h-72 mx-auto my-2 shrink-0">`;
+                    board.forEach((cell, idx) => {
+                        const canClick = isMyTurn && cell === '';
+                        let cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white/70 dark:bg-slate-800/80 border border-slate-300 dark:border-slate-700 shadow-inner"></div>`;
+                        if (cell === 'R') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-rose-500 to-red-600 shadow-md border-2 border-rose-300 animate-scale-in"></div>`;
+                        } else if (cell === 'B') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-sky-400 to-blue-600 shadow-md border-2 border-blue-300 animate-scale-in"></div>`;
+                        } else if (cell === 'Y') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-amber-300 to-yellow-500 shadow-md border-2 border-amber-200 animate-scale-in"></div>`;
+                        }
+                        const clickHandler = canClick ? `onclick="window.makeFourInARowMove('${post.id}', ${idx})"` : '';
+                        const hoverClass = canClick ? 'hover:bg-blue-200/50 dark:hover:bg-blue-950/40 cursor-pointer hover:scale-105 active:scale-95' : 'cursor-default';
+                        gridHtml += `
+                            <div ${clickHandler} class="w-full h-full flex items-center justify-center rounded-lg transition transform select-none ${hoverClass}">
+                                ${cellContent}
+                            </div>`;
+                    });
+                    gridHtml += `</div>`;
+
+                    gameHtml = `
+                        <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-slate-800 dark:to-slate-800 rounded-2xl border-2 border-blue-200 dark:border-blue-900/50 flex flex-col items-center">
+                            ${prizeStr}
+                            <h4 class="font-black text-blue-900 dark:text-blue-200 text-base mb-1">🔴🔵 4 in a Row (7x7)</h4>
+                            ${playersBadges}
+                            ${turnBadge}
+                            ${gridHtml}
+                        </div>`;
+                }
+            } else {
+                let outcomeHtml = '';
+                if (post.gameWinner === 'draw') {
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-amber-500/15 text-amber-800 dark:text-amber-300 border border-amber-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-handshake"></i> Match ended in a Draw!</div>`;
+                } else {
+                    const winnerName = post.gameWinner ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone') : 'Someone';
+                    const winnerSymbol = post.gameWinner === playerR ? '🔴' : (post.gameWinner === playerB ? '🔵' : '🟡');
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerSymbol} ${escapeHtml(winnerName)} won 4 in a Row!</span></div>`;
+                }
+
+                const winningLine = Array.isArray(post.fourWinningLine) ? post.fourWinningLine : [];
+                let gridHtml = `<div class="grid grid-cols-7 grid-rows-7 gap-1 p-2 bg-white/60 dark:bg-slate-900/60 rounded-xl border border-slate-200 dark:border-slate-700 w-64 h-64 mx-auto my-2 opacity-90 shrink-0">`;
+                board.forEach((cell, idx) => {
+                    const isWinCell = winningLine.includes(idx);
+                    let cellContent = `<div class="w-6 h-6 rounded-full bg-slate-200/60 dark:bg-slate-800/60 border border-slate-300 dark:border-slate-700"></div>`;
+                    if (cell === 'R') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-rose-500 to-red-600 shadow border border-rose-300 ${isWinCell ? 'ring-2 ring-yellow-400 scale-110' : ''}"></div>`;
+                    } else if (cell === 'B') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-sky-400 to-blue-600 shadow border border-blue-300 ${isWinCell ? 'ring-2 ring-yellow-400 scale-110' : ''}"></div>`;
+                    } else if (cell === 'Y') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-amber-300 to-yellow-500 shadow border border-amber-200 ${isWinCell ? 'ring-2 ring-yellow-400 scale-110' : ''}"></div>`;
+                    }
+                    gridHtml += `<div class="w-full h-full flex items-center justify-center select-none">${cellContent}</div>`;
+                });
+                gridHtml += `</div>`;
+
+                gameHtml = `
+                    <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
+                        ${prizeStr}
+                        <h4 class="font-black text-gray-700 dark:text-gray-300 text-base mb-1">🔴🔵 4 in a Row Ended</h4>
+                        ${gridHtml}
+                        ${outcomeHtml}
+                    </div>`;
+            }
+        } else if (post.gameType === 'drop_four') {
+            const isHost = window.currentUser && window.currentUser.uid === post.authorId;
+            const count = Number(post.dropFourPlayerCount) || 2;
+            const playerR = post.dropFourPlayerR;
+            const playerY = post.dropFourPlayerY;
+            const playerB = post.dropFourPlayerB;
+            const nameR = (playerR ? (window.globalUsersCache[playerR]?.name || 'Host') : 'Host');
+            const nameY = (playerY ? (window.globalUsersCache[playerY]?.name || 'Challenger 1') : (post.dropFourTargetUser ? (window.globalUsersCache[post.dropFourTargetUser]?.name || 'Challenger 1') : 'Waiting...'));
+            const nameB = (playerB ? (window.globalUsersCache[playerB]?.name || 'Challenger 2') : 'Waiting...');
+            const isTargeted = Boolean(post.dropFourTargetUser);
+            const myUid = window.currentUser ? window.currentUser.uid : null;
+            const isAlreadyIn = myUid && (myUid === playerR || myUid === playerY || myUid === playerB);
+            const isEligibleChallenger = myUid && !isAlreadyIn && (!isTargeted || post.dropFourTargetUser === myUid || (count === 3 && playerY && !playerB));
+
+            const board = post.dropFourBoard || Array(42).fill('');
+            const turn = post.dropFourTurn || 'R';
+            const isMyTurn = myUid && (
+                (turn === 'R' && myUid === playerR) ||
+                (turn === 'Y' && myUid === playerY) ||
+                (turn === 'B' && myUid === playerB)
+            );
+
+            if (post.gameStatus === 'active') {
+                if (post.dropFourStatus === 'waiting') {
+                    const acceptBtn = isEligibleChallenger ? `
+                        <button onclick="window.acceptDropFourChallenge('${post.id}')" class="mt-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black py-2.5 px-8 rounded-full shadow-lg transform transition hover:scale-105 active:scale-95 animate-pulse text-sm">
+                            <i class="fa-solid fa-circle-arrow-down mr-2"></i>Accept Challenge & Join Drop!
+                        </button>` : (isHost ? `<div class="mt-2 text-xs text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-slate-700 px-3 py-1 rounded-full">Waiting for challenger(s) to accept...</div>` : `<div class="mt-2 text-xs text-gray-400">Waiting for players to join...</div>`);
+
+                    const playersBadges = count === 3 ? `
+                        <div class="flex flex-wrap items-center justify-center gap-2 my-2 text-xs font-bold">
+                            <span class="bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300 px-2.5 py-1 rounded-full">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 px-2.5 py-1 rounded-full">🟡 ${playerY ? `@${escapeHtml(nameY)}` : 'Open Slot'}</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 px-2.5 py-1 rounded-full">🔵 ${playerB ? `@${escapeHtml(nameB)}` : 'Open Slot'}</span>
+                        </div>` : `
+                        <div class="flex items-center gap-3 my-2 text-xs font-bold">
+                            <span class="bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300 px-3 py-1 rounded-full">🔴 @${escapeHtml(nameR)} (Host)</span>
+                            <span class="text-gray-400 font-extrabold">VS</span>
+                            <span class="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 px-3 py-1 rounded-full">🟡 ${isTargeted ? `@${escapeHtml(nameY)}` : 'Open Challenger'}</span>
+                        </div>`;
+
+                    gameHtml = `
+                        <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-slate-800 dark:to-slate-800 rounded-2xl border-2 border-blue-300 dark:border-blue-900/50 flex flex-col items-center">
+                            ${prizeStr}
+                            <h4 class="font-black text-blue-900 dark:text-blue-200 text-base mb-1">🟡🔴 Connect 4</h4>
+                            ${playersBadges}
+                            ${acceptBtn}
+                        </div>`;
+                } else {
+                    const turnName = (turn === 'R' ? nameR : (turn === 'Y' ? nameY : nameB));
+                    const turnColor = turn === 'R' ? 'Red 🔴' : (turn === 'Y' ? 'Yellow 🟡' : 'Blue 🔵');
+                    const turnBadge = isMyTurn
+                        ? `<div class="bg-blue-600 text-white font-extrabold px-4 py-1.5 rounded-full text-xs animate-bounce shadow"><i class="fa-solid fa-play mr-1"></i>YOUR TURN (${turnColor})!</div>`
+                        : `<div class="bg-gray-100 dark:bg-slate-700 text-gray-700 dark:text-gray-300 font-bold px-3 py-1 rounded-full text-xs">Waiting for @${escapeHtml(turnName)} (${turnColor})'s move...</div>`;
+
+                    const playersBadges = count === 3 ? `
+                        <div class="flex flex-wrap items-center justify-between w-full max-w-xs text-xs font-bold mb-2">
+                            <span class="text-rose-600 dark:text-rose-400">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-amber-600 dark:text-amber-400">🟡 @${escapeHtml(nameY)}</span>
+                            <span class="text-blue-600 dark:text-blue-400">🔵 @${escapeHtml(nameB)}</span>
+                        </div>` : `
+                        <div class="flex items-center justify-between w-full max-w-xs text-xs font-bold mb-2">
+                            <span class="text-rose-600 dark:text-rose-400">🔴 @${escapeHtml(nameR)}</span>
+                            <span class="text-gray-400">VS</span>
+                            <span class="text-amber-600 dark:text-amber-400">🟡 @${escapeHtml(nameY)}</span>
+                        </div>`;
+
+                    // Top drop buttons for 7 columns
+                    let dropBtnsHtml = `<div class="grid grid-cols-7 gap-1 w-72 mx-auto mb-1 shrink-0">`;
+                    for (let c = 0; c < 7; c++) {
+                        const canDrop = isMyTurn && (board[c] === ''); // top row empty
+                        const btnClick = canDrop ? `onclick="window.makeDropFourMove('${post.id}', ${c})"` : '';
+                        const btnClass = canDrop ? 'bg-blue-500 hover:bg-blue-400 text-white cursor-pointer active:scale-90 hover:scale-105' : 'bg-transparent text-transparent cursor-default';
+                        dropBtnsHtml += `<button type="button" ${btnClick} class="w-full py-1 text-xs font-black rounded-lg transition ${btnClass}">⬇</button>`;
+                    }
+                    dropBtnsHtml += `</div>`;
+
+                    // 7 columns x 6 rows board
+                    let gridHtml = `<div class="grid grid-cols-7 grid-rows-6 gap-1 p-2.5 bg-blue-600 dark:bg-blue-800 rounded-2xl shadow-xl border-4 border-blue-700 dark:border-blue-900 w-72 h-64 mx-auto my-1 shrink-0">`;
+                    board.forEach((cell, idx) => {
+                        const col = idx % 7;
+                        const canClick = isMyTurn && (board[col] === '');
+                        let cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-slate-100 dark:bg-slate-900 border border-blue-500/50 dark:border-blue-900 shadow-inner"></div>`;
+                        if (cell === 'R') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-rose-500 to-red-600 shadow-md border-2 border-rose-300 animate-scale-in"></div>`;
+                        } else if (cell === 'Y') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-amber-300 to-yellow-400 shadow-md border-2 border-amber-200 animate-scale-in"></div>`;
+                        } else if (cell === 'B') {
+                            cellContent = `<div class="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-gradient-to-br from-sky-400 to-blue-500 shadow-md border-2 border-sky-200 animate-scale-in"></div>`;
+                        }
+                        const clickHandler = canClick ? `onclick="window.makeDropFourMove('${post.id}', ${col})"` : '';
+                        const hoverClass = canClick ? 'cursor-pointer hover:opacity-85' : 'cursor-default';
+                        gridHtml += `
+                            <div ${clickHandler} class="w-full h-full flex items-center justify-center select-none ${hoverClass}">
+                                ${cellContent}
+                            </div>`;
+                    });
+                    gridHtml += `</div>`;
+
+                    gameHtml = `
+                        <div class="mt-3 mb-2 p-4 bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-slate-800 dark:to-slate-800 rounded-2xl border-2 border-blue-300 dark:border-blue-900/50 flex flex-col items-center">
+                            ${prizeStr}
+                            <h4 class="font-black text-blue-900 dark:text-blue-200 text-base mb-1">🟡🔴 Connect 4</h4>
+                            ${playersBadges}
+                            ${turnBadge}
+                            ${dropBtnsHtml}
+                            ${gridHtml}
+                        </div>`;
+                }
+            } else {
+                let outcomeHtml = '';
+                if (post.gameWinner === 'draw') {
+                    outcomeHtml = `<div class="inline-flex items-center gap-1.5 bg-amber-500/15 text-amber-800 dark:text-amber-300 border border-amber-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-handshake"></i> Match ended in a Draw!</div>`;
+                } else {
+                    const winnerName = post.gameWinner ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone') : 'Someone';
+                    const winnerSymbol = post.gameWinner === playerR ? '🔴' : (post.gameWinner === playerY ? '🟡' : '🔵');
+                    outcomeHtml = `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerSymbol} ${escapeHtml(winnerName)} won Connect 4!</span></div>`;
+                }
+
+                const winningLine = Array.isArray(post.dropFourWinningLine) ? post.dropFourWinningLine : [];
+                let gridHtml = `<div class="grid grid-cols-7 grid-rows-6 gap-1 p-2 bg-blue-600/90 dark:bg-blue-900/90 rounded-2xl border-2 border-blue-700 dark:border-blue-950 w-64 h-56 mx-auto my-2 opacity-95 shrink-0">`;
+                board.forEach((cell, idx) => {
+                    const isWinCell = winningLine.includes(idx);
+                    let cellContent = `<div class="w-6 h-6 rounded-full bg-slate-100/70 dark:bg-slate-900/70 border border-blue-400/50 dark:border-blue-950"></div>`;
+                    if (cell === 'R') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-rose-500 to-red-600 shadow border border-rose-300 ${isWinCell ? 'ring-4 ring-yellow-300 scale-110' : ''}"></div>`;
+                    } else if (cell === 'Y') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-amber-300 to-yellow-400 shadow border border-amber-200 ${isWinCell ? 'ring-4 ring-white scale-110' : ''}"></div>`;
+                    } else if (cell === 'B') {
+                        cellContent = `<div class="w-6 h-6 rounded-full bg-gradient-to-br from-sky-400 to-blue-500 shadow border border-sky-200 ${isWinCell ? 'ring-4 ring-yellow-300 scale-110' : ''}"></div>`;
+                    }
+                    gridHtml += `<div class="w-full h-full flex items-center justify-center select-none">${cellContent}</div>`;
+                });
+                gridHtml += `</div>`;
+
+                gameHtml = `
+                    <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
+                        ${prizeStr}
+                        <h4 class="font-black text-gray-700 dark:text-gray-300 text-base mb-1">🟡🔴 Connect 4 Ended</h4>
                         ${gridHtml}
                         ${outcomeHtml}
                     </div>`;
@@ -1642,8 +2127,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone')
                     : 'No one';
                 const outcomeHtml = post.gameWinner && post.gameWinner !== 'none'
-                    ? `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} solved the word!</div>`
-                    : `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-xmark mr-1"></i> Game ended! No one solved it.</div>`;
+                    ? `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} solved the word!</span></div>`
+                    : `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-xmark"></i> Game ended! No one solved it.</div>`;
 
                 gameHtml = `
                     <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
@@ -1681,8 +2166,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone')
                     : 'No one';
                 const outcomeHtml = post.gameWinner && post.gameWinner !== 'none'
-                    ? `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} got the right answer!</div>`
-                    : `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-xmark mr-1"></i> Game ended! No one got it.</div>`;
+                    ? `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} got the right answer!</span></div>`
+                    : `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-xmark"></i> Game ended! No one got it.</div>`;
 
                 gameHtml = `
                     <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
@@ -1729,8 +2214,8 @@ window.generatePostHTML = function(post, prefix, filterContext) {
                     ? (window.globalUsersCache[post.gameWinner]?.name || 'Someone')
                     : 'No one';
                 const outcomeHtml = post.gameWinner && post.gameWinner !== 'none'
-                    ? `<div class="bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-trophy mr-1"></i> ${winnerName} solved the riddle!</div>`
-                    : `<div class="bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 font-bold px-4 py-2 rounded-full text-sm text-center mt-2"><i class="fa-solid fa-xmark mr-1"></i> Game ended! No one solved it.</div>`;
+                    ? `<div class="inline-flex items-center gap-2 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-trophy text-amber-400"></i> <span>${winnerName} solved the riddle!</span></div>`
+                    : `<div class="inline-flex items-center gap-1.5 bg-red-500/15 text-red-700 dark:text-red-300 border border-red-500/30 font-bold px-4 py-1.5 rounded-full text-xs text-center shadow-sm mt-2"><i class="fa-solid fa-xmark"></i> Game ended! No one solved it.</div>`;
 
                 gameHtml = `
                     <div class="mt-3 mb-2 p-4 bg-gray-50 dark:bg-slate-900/50 rounded-2xl border border-gray-200 dark:border-slate-700 flex flex-col items-center opacity-90 text-center">
@@ -1770,7 +2255,7 @@ window.generatePostHTML = function(post, prefix, filterContext) {
         
         <div id="post-body-${prefix}-${post.id}">
             ${post.text ? `<p class="text-sm text-gray-800 dark:text-gray-200 mb-1 whitespace-pre-wrap break-words leading-snug">${safePostText} ${post.edited ? '<span class="text-[10px] italic text-gray-400 ml-1 font-normal">(edited)</span>' : ''}</p>${window.generateEmbed(post.text)}` : ''}
-            ${post.image ? ((post.image.includes('/video/upload/') || post.image.match(/\.(mp4|webm|mov|ogg)$/i)) ? `<video src="${post.image}" controls class="w-full rounded-lg mb-2 max-h-96 bg-black mt-2"></video>` : `<img src="${post.image}" loading="lazy" class="w-full rounded-lg mb-2 object-cover max-h-80 border border-gray-100 dark:border-slate-700 shadow-sm mt-2 cursor-pointer hover:opacity-90 transition" onclick="window.viewImage('${post.image}')">`) : ''}
+            ${window.renderPostMedia(post)}
             ${gameHtml}
         </div>
         
@@ -2002,6 +2487,7 @@ window.openRankingModal = () => {
     // Clear caches so data is fresh on every open
     window._earningsCache = null;
     window._hostedGamesCache = null;
+    if (window.updateLbPeriodBar) window.updateLbPeriodBar();
     window.renderRankings(true);
 };
 
@@ -2027,21 +2513,41 @@ window.renderRankings = async (resetLimit = true) => {
             if(resetLimit) list.innerHTML = '';
             loader.classList.remove('hidden');
             try {
-                const snap = await get(ref(db, `users/${window.currentUser.uid}/earnings`));
+                const [newSnap, legacySnap] = await Promise.all([
+                    get(ref(db, `earnings/${window.currentUser.uid}`)).catch(() => null),
+                    get(ref(db, `users/${window.currentUser.uid}/earnings`)).catch(() => null)
+                ]);
                 loader.classList.add('hidden');
                 
-                if (!snap.exists()) {
+                let earningsArray = [];
+                const seenEarningsKeys = new Set();
+                if (newSnap && newSnap.exists()) {
+                    newSnap.forEach(child => {
+                        const val = child.val();
+                        earningsArray.push({ id: child.key, ...val });
+                        if (val && val.postId) seenEarningsKeys.add(`${val.postId}_${val.title}`);
+                        seenEarningsKeys.add(child.key);
+                    });
+                }
+                if (legacySnap && legacySnap.exists()) {
+                    legacySnap.forEach(child => {
+                        const val = child.val();
+                        const postKey = val && val.postId ? `${val.postId}_${val.title}` : null;
+                        if (!seenEarningsKeys.has(child.key) && (!postKey || !seenEarningsKeys.has(postKey))) {
+                            earningsArray.push({ id: child.key, ...val });
+                            seenEarningsKeys.add(child.key);
+                            if (postKey) seenEarningsKeys.add(postKey);
+                        }
+                    });
+                }
+
+                if (earningsArray.length === 0) {
                     list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">You have no earnings yet.</p>`;
                     window._earningsCache = [];
                     return;
                 }
                 
-                let earningsArray = [];
-                snap.forEach(child => {
-                    earningsArray.push({ id: child.key, ...child.val() });
-                });
-                
-                earningsArray.sort((a, b) => b.timestamp - a.timestamp);
+                earningsArray.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                 window._earningsCache = earningsArray;
             } catch (error) {
                 console.error(error);
@@ -2058,7 +2564,8 @@ window.renderRankings = async (resetLimit = true) => {
         if (resetLimit && earningsArray.length > 0) {
             const totalLb = earningsArray.reduce((sum, e) => sum + (e.lbPoints || 0), 0);
             const totalPrize = earningsArray.reduce((sum, e) => {
-                const num = parseFloat((e.prize || '').toString().replace(/[^0-9.]/g, ''));
+                const str = (e.prize || '').toString().split(' + Bonus:')[0];
+                const num = parseFloat(str.replace(/[^0-9.]/g, ''));
                 return sum + (isNaN(num) ? 0 : num);
             }, 0);
 
@@ -2071,7 +2578,7 @@ window.renderRankings = async (resetLimit = true) => {
                 </div>
                 <div class="w-px h-10 bg-yellow-200 dark:bg-yellow-800/50"></div>
                 <div class="text-center">
-                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? totalPrize : earningsArray.filter(e => e.prize).length + ' reward(s)'}</div>
+                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? 'PHP ' + totalPrize.toLocaleString() : (earningsArray.filter(e => e.prize).length + ' reward(s)')}</div>
                     <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total Prize Value</div>
                 </div>
                 <div class="w-px h-10 bg-yellow-200 dark:bg-yellow-800/50"></div>
@@ -2092,18 +2599,17 @@ window.renderRankings = async (resetLimit = true) => {
             
             const ts = e.timestamp?.toMillis ? e.timestamp.toMillis() : e.timestamp;
             const date = new Date(ts).toLocaleDateString();
-            const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold mr-1">🎁 ${e.prize}</span>` : '';
-            const lbStr = e.lbPoints ? `<span class="bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400 px-2 py-0.5 rounded text-xs font-bold">🏆 +${e.lbPoints}</span>` : '';
+            const badgesHtml = window.formatLogPrizeBadges(e.prize, e.lbPoints);
             
             el.innerHTML = `
                 <div class="flex justify-between items-start mb-1">
                     <h4 class="font-bold text-sm text-gray-800 dark:text-gray-200 leading-tight">
-                        ${e.title}
+                        ${escapeHtml(e.title)}
                     </h4>
                     <span class="text-[10px] text-gray-400 shrink-0 ml-2">${date}</span>
                 </div>
-                <div class="flex items-center mb-1">
-                    ${prizeStr}${lbStr}
+                <div class="flex flex-wrap items-center gap-1 mb-1">
+                    ${badgesHtml}
                 </div>
                 ${e.postId ? `<button onclick="window.goToPost('${e.postId}'); document.getElementById('ranking-modal').classList.add('hidden');" class="text-[10px] text-blue-500 hover:underline mt-1 self-start">View Game</button>` : ''}
             `;
@@ -2142,21 +2648,56 @@ window.renderRankings = async (resetLimit = true) => {
             if (resetLimit) list.innerHTML = '';
             loader.classList.remove('hidden');
             try {
-                const snap = await get(ref(db, `users/${window.currentUser.uid}/hostedGames`));
+                const [newSnap, legacySnap] = await Promise.all([
+                    get(ref(db, `hostedGames/${window.currentUser.uid}`)).catch(() => null),
+                    get(ref(db, `users/${window.currentUser.uid}/hostedGames`)).catch(() => null)
+                ]);
                 loader.classList.add('hidden');
 
-                if (!snap.exists()) {
+                let hostedArray = [];
+                const seenHostedKeys = new Set();
+                if (newSnap && newSnap.exists()) {
+                    newSnap.forEach(child => {
+                        const val = child.val();
+                        hostedArray.push({ id: child.key, ...val });
+                        if (val && val.postId) seenHostedKeys.add(`${val.postId}_${val.title}`);
+                        seenHostedKeys.add(child.key);
+                    });
+                }
+                if (legacySnap && legacySnap.exists()) {
+                    legacySnap.forEach(child => {
+                        const val = child.val();
+                        const postKey = val && val.postId ? `${val.postId}_${val.title}` : null;
+                        if (!seenHostedKeys.has(child.key) && (!postKey || !seenHostedKeys.has(postKey))) {
+                            hostedArray.push({ id: child.key, ...val });
+                            seenHostedKeys.add(child.key);
+                            if (postKey) seenHostedKeys.add(postKey);
+                        }
+                    });
+                }
+
+                if (hostedArray.length === 0) {
                     list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">You have no hosted games yet.</p>`;
                     window._hostedGamesCache = [];
                     return;
                 }
 
-                let hostedArray = [];
-                snap.forEach(child => {
-                    hostedArray.push({ id: child.key, ...child.val() });
+                hostedArray.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+                // Filter to only show games with a monetary prize (PHP amount > 0)
+                const prizedGames = hostedArray.filter(e => {
+                    const prizeStr = (e.prize || '').toString().split('+')[0].trim();
+                    const num = parseFloat(prizeStr.replace(/[^0-9.]/g, ''));
+                    return !isNaN(num) && num > 0;
                 });
-                hostedArray.sort((a, b) => b.timestamp - a.timestamp);
-                window._hostedGamesCache = hostedArray;
+
+                if (prizedGames.length === 0) {
+                    list.innerHTML = `<p class="text-center text-gray-500 text-sm py-4">No games with monetary prizes yet.</p>`;
+                    window._hostedGamesCache = [];
+                    return;
+                }
+
+                window._hostedGamesCache = prizedGames;
             } catch (error) {
                 console.error(error);
                 loader.classList.add('hidden');
@@ -2171,7 +2712,8 @@ window.renderRankings = async (resetLimit = true) => {
         // Summary banner
         if (resetLimit && hostedArray.length > 0) {
             const totalPrize = hostedArray.reduce((sum, e) => {
-                const num = parseFloat((e.prize || '').toString().replace(/[^0-9.]/g, ''));
+                const str = (e.prize || '').toString().split(' + Bonus:')[0];
+                const num = parseFloat(str.replace(/[^0-9.]/g, ''));
                 return sum + (isNaN(num) ? 0 : num);
             }, 0);
             const pendingCount = hostedArray.filter(e => e.paymentStatus !== 'paid').length;
@@ -2185,7 +2727,7 @@ window.renderRankings = async (resetLimit = true) => {
                 </div>
                 <div class="w-px h-10 bg-indigo-200 dark:bg-indigo-800/50"></div>
                 <div class="text-center">
-                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? totalPrize : hostedArray.filter(e => e.prize).length + ' prize(s)'}</div>
+                    <div class="text-xl font-black text-green-600 dark:text-green-400">🎁 ${totalPrize > 0 ? 'PHP ' + totalPrize.toLocaleString() : (hostedArray.filter(e => e.prize).length + ' prize(s)')}</div>
                     <div class="text-[10px] text-gray-500 dark:text-gray-400 font-semibold mt-0.5">Total Prize Given</div>
                 </div>
                 <div class="w-px h-10 bg-indigo-200 dark:bg-indigo-800/50"></div>
@@ -2206,7 +2748,7 @@ window.renderRankings = async (resetLimit = true) => {
 
             const ts = e.timestamp?.toMillis ? e.timestamp.toMillis() : e.timestamp;
             const date = new Date(ts).toLocaleDateString();
-            const prizeStr = e.prize ? `<span class="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 px-2 py-0.5 rounded text-xs font-bold">🎁 ${e.prize}</span>` : '';
+            const badgesHtml = window.formatLogPrizeBadges(e.prize, e.lbPoints);
             const isPaid = e.paymentStatus === 'paid';
             const payBtn = `<button
                 id="pay-btn-${e.id}"
@@ -2218,14 +2760,16 @@ window.renderRankings = async (resetLimit = true) => {
 
             el.innerHTML = `
                 <div class="flex justify-between items-start mb-1">
-                    <h4 class="font-bold text-sm text-gray-800 dark:text-gray-200 leading-tight truncate pr-2">${e.title}</h4>
+                    <h4 class="font-bold text-sm text-gray-800 dark:text-gray-200 leading-tight truncate pr-2">${escapeHtml(e.title)}</h4>
                     <span class="text-[10px] text-gray-400 shrink-0">${date}</span>
                 </div>
                 <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5">
-                    🏆 Winner: <span class="font-semibold text-gray-700 dark:text-gray-300">${e.winnerName || 'Unknown'}</span>
+                    🏆 Winner: <span class="font-semibold text-gray-700 dark:text-gray-300">${escapeHtml(e.winnerName || 'Unknown')}</span>
                 </div>
-                <div class="flex items-center gap-2">
-                    ${prizeStr}
+                <div class="flex items-center justify-between gap-2">
+                    <div class="flex flex-wrap items-center gap-1">
+                        ${badgesHtml}
+                    </div>
                     ${payBtn}
                 </div>
                 ${e.postId ? `<button onclick="window.goToPost('${e.postId}'); document.getElementById('ranking-modal').classList.add('hidden');" class="text-[10px] text-blue-500 hover:underline mt-1 self-start">View Game</button>` : ''}
@@ -2259,7 +2803,22 @@ window.renderRankings = async (resetLimit = true) => {
         let usersArray = Object.keys(window.globalUsersCache).map(uid => ({uid, ...window.globalUsersCache[uid]})).filter(u => u.name);
         
         if (window.currentRankingFilter === "Leaderboards") {
-            usersArray.sort((a, b) => (b.lbPoints || 0) - (a.lbPoints || 0));
+            const scope = window.lbScope || 'overall';
+            let lbMap = null;
+            if (scope !== 'overall') {
+                const period = window.lbPeriodKey || window.lbPeriodKeyFor(scope);
+                const snap = await get(ref(db, `lb${scope === 'weekly' ? 'Weekly' : 'Monthly'}/${period}`)).catch(() => null);
+                if (snap && snap.exists()) lbMap = snap.val();
+            }
+            const emptyPeriod = scope !== 'overall' && !lbMap;
+            usersArray.forEach(u => {
+                u.displayLb = scope === 'overall' ? (u.lbPoints || 0) : Number((lbMap || {})[u.uid] || 0);
+            });
+            usersArray.sort((a, b) => (b.displayLb || 0) - (a.displayLb || 0));
+            if (emptyPeriod) {
+                list.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 text-xs py-4">No LB points recorded in this ${scope === 'weekly' ? 'week' : 'month'} yet.</p>`;
+                return;
+            }
         } else if (window.currentRankingFilter === "Stars") {
             usersArray.sort((a, b) => (b.points || 0) - (a.points || 0));
         }
@@ -2283,7 +2842,7 @@ window.renderRankings = async (resetLimit = true) => {
             el.className = `flex items-center justify-between p-2 bg-gray-50 dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-700/50 mb-2`;
             
             const highlightValue = window.currentRankingFilter === "Leaderboards" 
-                ? `<span class="text-yellow-600 dark:text-yellow-500 font-bold">🏆 ${u.lbPoints || 0}</span>` 
+                ? `<span class="text-yellow-600 dark:text-yellow-500 font-bold">🏆 ${u.displayLb !== undefined ? u.displayLb : (u.lbPoints || 0)}</span>` 
                 : `<span class="text-yellow-600 dark:text-yellow-500 font-bold">⭐ ${u.points || 0}</span>`;
             
             el.innerHTML = `
@@ -2329,12 +2888,65 @@ window.renderRankings = async (resetLimit = true) => {
     requestAnimationFrame(() => list.style.minHeight = '');
 };
 
+// ============================================================
+// LEADERBOARD PERIOD CONTROLS (Weekly / Monthly / Overall)
+// ============================================================
+window.updateLbPeriodBar = () => {
+    const bar = document.getElementById('ranking-period-bar');
+    if (!bar) return;
+    const isFilter = window.currentRankingFilter === 'Leaderboards';
+    bar.classList.toggle('hidden', !isFilter);
+    if (!isFilter) return;
+    const scope = window.lbScope || 'overall';
+    ['overall', 'weekly', 'monthly'].forEach(s => {
+        const b = document.getElementById('lb-scope-' + s);
+        if (!b) return;
+        const on = s === scope;
+        if (on) {
+            b.classList.add('bg-blue-600', 'text-white', 'border-transparent');
+            b.classList.remove('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300');
+        } else {
+            b.classList.remove('bg-blue-600', 'text-white', 'border-transparent');
+            b.classList.add('bg-gray-100', 'text-gray-700', 'dark:bg-slate-900', 'dark:text-gray-300');
+        }
+    });
+    const nav = document.getElementById('lb-period-nav');
+    const lbl = document.getElementById('lb-period-label');
+    if (scope === 'overall') {
+        if (nav) nav.classList.add('hidden');
+        if (lbl) lbl.textContent = '';
+    } else {
+        const key = window.lbPeriodKey || window.lbPeriodKeyFor(scope);
+        if (nav) nav.classList.remove('hidden');
+        if (lbl) lbl.textContent = window.lbPeriodLabel(scope, key);
+    }
+};
+
+window.setLbScope = (scope) => {
+    window.lbScope = scope;
+    window.lbPeriodKey = scope === 'overall' ? '' : window.lbPeriodKeyFor(scope);
+    window.renderRankings(true);
+    window.updateLbPeriodBar();
+};
+
+window.shiftLbPeriodView = (delta) => {
+    const scope = window.lbScope;
+    if (!scope || scope === 'overall') return;
+    const cur = window.lbPeriodKey || window.lbPeriodKeyFor(scope);
+    window.lbPeriodKey = window.shiftLbPeriod(scope, cur, delta);
+    window.renderRankings(true);
+    window.updateLbPeriodBar();
+};
+
 window.markHostedGamePaid = async (entryId, btn) => {
     if (!window.currentUser) return;
     try {
         btn.disabled = true;
         btn.textContent = 'Saving...';
-        await update(ref(db, `users/${window.currentUser.uid}/hostedGames/${entryId}`), { paymentStatus: 'paid' });
+        await Promise.all([
+            update(ref(db, `hostedGames/${window.currentUser.uid}/${entryId}`), { paymentStatus: 'paid' }).catch(() => {}),
+            update(ref(db, `users/${window.currentUser.uid}/hostedGames/${entryId}`), { paymentStatus: 'paid' }).catch(() => {})
+        ]);
         // Update local cache so re-renders stay consistent
         if (window._hostedGamesCache) {
             const entry = window._hostedGamesCache.find(e => e.id === entryId);
