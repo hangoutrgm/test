@@ -1518,7 +1518,7 @@ document.getElementById('auth-action-btn').addEventListener('click', async () =>
             const newPic = window.generateAvatar(cred.user.uid);
             await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
             
-            update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic });
+            await update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic }).catch(e => console.warn('Profile write failed:', e));
             document.getElementById('nav-avatar').src = newPic;
             window.showAlert("Account created successfully!");
         } else {
@@ -1584,7 +1584,7 @@ document.getElementById('guest-login-btn').addEventListener('click', async () =>
             const newPic = window.generateAvatar(cred.user.uid);
             await updateProfile(cred.user, { displayName: newName, photoURL: newPic });
             
-            update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic, isGuest: true });
+            await update(ref(db, `users/${cred.user.uid}`), { name: newName, pic: newPic, isGuest: true }).catch(e => console.warn('Profile write failed:', e));
             document.getElementById('nav-avatar').src = newPic;
             document.getElementById('auth-modal').classList.add('hidden');
             window.showAlert("Guest account created!");
@@ -1610,7 +1610,20 @@ onAuthStateChanged(auth, (user) => {
             // Give time for globalUsersCache to populate
             setTimeout(() => window.logActivity("logged in"), 1000);
         }
-        update(ref(db, `users/${user.uid}`), { lastSeen: serverTimestamp() });
+        // Profile self-heal: guarantee a usable name/pic always exists for this account.
+        // Fixes the historical "undefined"-name bug where this login write created a bare
+        // {lastSeen} record before/without the signup profile write landing (race condition).
+        // Never overwrites existing values — only fills what's missing.
+        get(ref(db, `users/${user.uid}`)).then((snap) => {
+            const p = snap.val() || {};
+            const patch = { lastSeen: serverTimestamp() };
+            const prefix = user.isAnonymous ? 'Guest_' : 'User_';
+            const hasName = p.name && p.name !== 'undefined' && p.name !== 'null';
+            const hasPic = p.pic && p.pic !== 'undefined' && p.pic !== 'null';
+            if (!hasName) patch.name = (user.displayName && user.displayName !== 'undefined') ? user.displayName : `${prefix}${Math.floor(Math.random() * 999)}`;
+            if (!hasPic) patch.pic = user.photoURL || window.generateAvatar(user.uid);
+            return update(ref(db, `users/${user.uid}`), patch);
+        }).catch(e => console.warn('Profile self-heal failed:', e));
         
         startOwnPresence(user);
         
@@ -1629,11 +1642,6 @@ onAuthStateChanged(auth, (user) => {
 
         // Start the dedicated notifications listener for this user
         if (window._startNotifListener) window._startNotifListener(user.uid);
-
-        // Auto-migrate user's legacy earnings and hostedGames out of /users
-        if (window.migrateUserEarningsAndHostedGames) {
-            setTimeout(() => window.migrateUserEarningsAndHostedGames(user.uid), 2000);
-        }
 
         // Auto-cleanup: keep only the latest 50 notifications in the database
         setTimeout(() => {

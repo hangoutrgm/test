@@ -1,0 +1,166 @@
+// ============================================================
+// chat/games/index.js — public API + picker wiring
+// Exposes window.ChatGames used by app.js and inline onclicks.
+// ============================================================
+import * as engine from './engine.js?v=6';
+import { renderBody, pickerHtml, setContext } from './renderers.js?v=12';
+import { GAME_META } from './helpers.js?v=5';
+
+let _getThreadId = () => null;
+let _toast = (m) => console.log('[ChatGames]', m);
+
+const ensureThread = () => {
+  const t = _getThreadId();
+  if (!t) _toast('Open a conversation first.');
+  return t;
+};
+
+// ── Picker dialog ──
+let _pickerEl = null;
+const openPicker = () => {
+  if (!ensureThread()) return;
+  if (!_pickerEl) {
+    _pickerEl = document.createElement('dialog');
+    _pickerEl.id = 'chat-games-picker';
+    _pickerEl.className = 'dialog cg-picker-dialog';
+    _pickerEl.innerHTML = `
+      <div class="dialog-card cg-picker-card">
+        <header class="dialog-header">
+          <div class="dialog-header-icon accent-icon">
+            <svg viewBox="0 0 24 24"><polygon points="6 2 18 2 18 6 6 6 6 2"/><rect x="3" y="6" width="18" height="16" rx="2"/><circle cx="12" cy="14" r="3"/></svg>
+          </div>
+          <h2 style="flex:1;margin:0;font-size:17px;font-weight:800;">Choose a Game</h2>
+          <button class="dialog-close-btn cg-close" type="button" aria-label="Close">
+            <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </header>
+        <div class="cg-picker-scroll">
+          ${pickerHtml()}
+        </div>
+        <p class="cg-picker-footer">🎮 Games are played directly in chat — challenge your friends!</p>
+      </div>`;
+    document.body.appendChild(_pickerEl);
+    _pickerEl.querySelector('.cg-close')?.addEventListener('click', () => _pickerEl.close());
+    _pickerEl.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.cg-pick-card, .cg-pick');
+      if (!btn) return;
+      const type = btn.dataset.type;
+      _pickerEl.close();
+      try { await engine.createGame(type); } catch (err) { console.error(err); _toast('Could not start that game.'); }
+    });
+  }
+  _pickerEl.showModal();
+};
+
+// ── Hangman setup modal — host picks the secret word (+ optionally reveal letters) ──
+const hangmanSetup = () => new Promise((resolve) => {
+  const dlg = document.createElement('dialog');
+  dlg.className = 'dialog cg-picker-dialog';
+  dlg.innerHTML = `
+    <div class="dialog-card cg-picker-card">
+      <header class="dialog-header">
+        <div class="dialog-header-icon accent-icon">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><text x="7" y="17" font-size="11" font-weight="800" fill="#fff">A?</text></svg>
+        </div>
+        <h2 style="flex:1;margin:0;font-size:17px;font-weight:800;">Hangman Setup</h2>
+        <button class="dialog-close-btn cg-hm-cancel" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </header>
+      <div style="padding:8px 4px 4px;text-align:left;">
+        <label class="cg-hm-label">Secret word (letters & spaces only)</label>
+        <input id="cg-hm-word" class="cg-hm-input" maxlength="30" autocomplete="off" spellcheck="false" placeholder="e.g. PHILIPPINES">
+        <label class="cg-hm-label">Reveal starting letters — optional (comma separated)</label>
+        <input id="cg-hm-clues" class="cg-hm-input" maxlength="25" autocomplete="off" spellcheck="false" placeholder="e.g. P, I, N">
+        <p class="cg-picker-footer">🪓 Each player gets 2 wrong letter guesses + 2 wrong whole-word guesses.</p>
+      </div>
+      <div class="cg-hm-actions">
+        <button type="button" class="cg-btn cg-hm-cancel">Cancel</button>
+        <button type="button" class="cg-btn green cg-hm-start">Start Game</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+  const done = (val) => { try { dlg.close(); } catch (_) {} dlg.remove(); resolve(val); };
+  dlg.querySelectorAll('.cg-hm-cancel').forEach((b) => b.addEventListener('click', () => done(null)));
+  dlg.querySelector('.cg-hm-start')?.addEventListener('click', () => {
+    const word = dlg.querySelector('#cg-hm-word').value;
+    const clues = dlg.querySelector('#cg-hm-clues').value;
+    if (!/^[A-Za-z][A-Za-z ]{1,29}$/.test(word.trim())) { _toast('Word must be 2-30 letters (no numbers/symbols).'); return; }
+    done({ word: word.trim(), clues });
+  });
+  dlg.addEventListener('cancel', () => done(null)); // Esc key
+  dlg.showModal();
+  setTimeout(() => dlg.querySelector('#cg-hm-word')?.focus(), 50);
+});
+engine.setHostInputs({ hangman: hangmanSetup });
+
+// ── Gibberish setup modal — host types the nonsense phrase + the real answer ──
+const gibberishSetup = () => new Promise((resolve) => {
+  const dlg = document.createElement('dialog');
+  dlg.className = 'dialog cg-picker-dialog';
+  dlg.innerHTML = `
+    <div class="dialog-card cg-picker-card">
+      <header class="dialog-header">
+        <div class="dialog-header-icon accent-icon">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 10h8M8 14h5"/></svg>
+        </div>
+        <h2 style="flex:1;margin:0;font-size:17px;font-weight:800;">Gibberish Setup</h2>
+        <button class="dialog-close-btn cg-gb-cancel" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </header>
+      <div style="padding:8px 4px 4px;text-align:left;">
+        <label class="cg-hm-label">Your nonsense phrase</label>
+        <input id="cg-gb-phrase" class="cg-hm-input" maxlength="60" autocomplete="off" placeholder='e.g. Hue Can Knot Paws'>
+        <label class="cg-hm-label">The real answer (players must guess this)</label>
+        <input id="cg-gb-answer" class="cg-hm-input" maxlength="60" autocomplete="off" placeholder="e.g. You cannot pass">
+        <p class="cg-picker-footer">🗣️ Say it out loud — first to decode it wins the round!</p>
+      </div>
+      <div class="cg-hm-actions">
+        <button type="button" class="cg-btn cg-gb-cancel">Cancel</button>
+        <button type="button" class="cg-btn green cg-gb-start">Start Game</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+  const done = (val) => { try { dlg.close(); } catch (_) {} dlg.remove(); resolve(val); };
+  dlg.querySelectorAll('.cg-gb-cancel').forEach((b) => b.addEventListener('click', () => done(null)));
+  dlg.querySelector('.cg-gb-start')?.addEventListener('click', () => {
+    const phrase = dlg.querySelector('#cg-gb-phrase').value.trim();
+    const answer = dlg.querySelector('#cg-gb-answer').value.trim();
+    if (!phrase || !answer) { _toast('Both the phrase and the answer are required.'); return; }
+    done({ phrase, answer });
+  });
+  dlg.addEventListener('cancel', () => done(null)); // Esc key
+  dlg.showModal();
+  setTimeout(() => dlg.querySelector('#cg-gb-phrase')?.focus(), 50);
+});
+engine.setHostInputs({
+  hangman: hangmanSetup,
+  gibberish: gibberishSetup,
+});
+
+
+window.ChatGames = {
+  /** Called once by chat app.js to provide context hooks. */
+  init: ({ getThreadId, getName, toast }) => {
+    if (typeof getThreadId === 'function') { _getThreadId = getThreadId; engine.setThreadGetter(getThreadId); }
+    setContext({ getName });
+    if (typeof toast === 'function') _toast = toast;
+  },
+  openPicker,
+  renderBody,
+  create: async (type) => { if (ensureThread()) await engine.createGame(type); },
+  move: (mid, idx) => engine.playMove(mid, idx),
+  join: (mid) => engine.joinGame(mid),
+  guessLetter: (mid, L) => engine.guessLetter(mid, L),
+  guessWord: (mid, value) => engine.guessWord(mid, value),
+  mine: async (mid) => {
+    const r = await engine.mineNow(mid);
+    if (r === 'host') _toast("You can't mine your own gem! 💎");
+    else if (r === 'late') _toast('Too late — someone already mined it!');
+  },
+  guess: (mid, value) => engine.submitGuess(mid, value),
+  close: (mid) => engine.closeGame(mid),
+};
+
+export default window.ChatGames;

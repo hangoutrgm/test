@@ -160,6 +160,7 @@ function initAdminDashboard() {
             document.getElementById('set-commentCooldownSec').value = settings.commentCooldownSec ?? window.siteSettings.commentCooldownSec ?? '';
             document.getElementById('set-chatCooldownSec').value = settings.chatCooldownSec ?? window.siteSettings.chatCooldownSec ?? '';
             document.getElementById('set-starsPerComment').value = settings.starsPerComment ?? '';
+            document.getElementById('set-starsPerLike').value = settings.starsPerLike ?? '';
             document.getElementById('set-starsPerPoked').value = settings.starsPerPoked ?? '';
             document.getElementById('set-pokeLimit').value = settings.pokeLimit ?? window.siteSettings.pokeLimit ?? '';
             document.getElementById('set-starsPerFollow').value = settings.starsPerFollow ?? '';
@@ -181,6 +182,7 @@ function initAdminDashboard() {
             document.getElementById('set-commentCooldownSec').value = '';
             document.getElementById('set-chatCooldownSec').value = '';
             document.getElementById('set-starsPerComment').value = '';
+            document.getElementById('set-starsPerLike').value = '';
             document.getElementById('set-starsPerPoked').value = '';
             document.getElementById('set-pokeLimit').value = '';
             document.getElementById('set-starsPerFollow').value = '';
@@ -204,6 +206,7 @@ function initAdminDashboard() {
         document.getElementById('set-commentCooldownSec').placeholder = window.siteSettings.commentCooldownSec ?? 60;
         document.getElementById('set-chatCooldownSec').placeholder = window.siteSettings.chatCooldownSec ?? 60;
         document.getElementById('set-starsPerComment').placeholder = window.siteSettings.starsPerComment;
+        document.getElementById('set-starsPerLike').placeholder = window.siteSettings.starsPerLike ?? 1;
         document.getElementById('set-starsPerPoked').placeholder = window.siteSettings.starsPerPoked;
         document.getElementById('set-pokeLimit').placeholder = window.siteSettings.pokeLimit ?? 3;
         document.getElementById('set-starsPerFollow').placeholder = window.siteSettings.starsPerFollow ?? '5';
@@ -227,6 +230,7 @@ function initAdminDashboard() {
             commentCooldownSec: parseInt(document.getElementById('set-commentCooldownSec').value) || 0,
             chatCooldownSec: parseInt(document.getElementById('set-chatCooldownSec').value) || 0,
             starsPerComment: parseInt(document.getElementById('set-starsPerComment').value) || 0,
+            starsPerLike: parseInt(document.getElementById('set-starsPerLike').value) || 0,
             starsPerPoked: parseInt(document.getElementById('set-starsPerPoked').value) || 0,
             pokeLimit: parseInt(document.getElementById('set-pokeLimit').value) || 0,
             starsPerFollow: parseInt(document.getElementById('set-starsPerFollow').value) || 0,
@@ -307,6 +311,47 @@ function initAdminDashboard() {
     // Keep latest known state for the confirm dialogs
     onValue(ref(db, 'settings/pausePosts'), (snap) => { currentPauseState.pausePosts = snap.val() === true; });
     onValue(ref(db, 'settings/pauseChat'), (snap) => { currentPauseState.pauseChat = snap.val() === true; });
+
+    // 5b. Maintenance — heal users with missing / "undefined" name or pic.
+    // Only fills gaps; never overwrites valid values.
+    const healBtn = document.getElementById('heal-names-btn');
+    if (healBtn) {
+        healBtn.addEventListener('click', async () => {
+            const isBad = (v) => !v || v === 'undefined' || v === 'null';
+            if (!confirm('Scan ALL users and fix missing/broken names & pics?\n\nValid profiles are never touched.')) return;
+            const originalHtml = healBtn.innerHTML;
+            healBtn.disabled = true;
+            healBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-xs"></i><span class="text-xs font-bold">Scanning…</span>';
+            try {
+                const snap = await get(ref(db, 'users'));
+                const users = snap.val() || {};
+                const updates = [];
+                Object.entries(users).forEach(([uid, u]) => {
+                    u = u || {};
+                    const patch = {};
+                    if (isBad(u.name)) {
+                        let healedName;
+                        if (u.isGuest) healedName = `Guest_${String(uid).slice(-4)}`;
+                        else {
+                            const em = typeof u.email === 'string' ? u.email.split('@')[0] : '';
+                            healedName = /^[a-zA-Z0-9._-]{3,18}$/.test(em) && em.toLowerCase() !== 'undefined' ? em : `User_${String(uid).slice(-4)}`;
+                        }
+                        patch.name = healedName;
+                    }
+                    if (isBad(u.pic)) patch.pic = window.generateAvatar ? window.generateAvatar(uid) : `https://api.dicebear.com/7.x/bottts/svg?seed=${uid}&backgroundColor=transparent`;
+                    if (Object.keys(patch).length) updates.push(update(ref(db, `users/${uid}`), patch));
+                });
+                await Promise.allSettled(updates);
+                alert(`Cleanup complete!\n\nScanned: ${Object.keys(users).length} user(s)\nFixed: ${updates.length} profile(s)`);
+            } catch (e) {
+                console.error('Heal failed:', e);
+                alert('Cleanup failed: ' + e.message);
+            } finally {
+                healBtn.disabled = false;
+                healBtn.innerHTML = originalHtml;
+            }
+        });
+    }
 
     // 5c. Game Posting Limits — inputs & save
     function renderGameLimitInputs(values = {}) {

@@ -613,6 +613,7 @@ window.renderProfileData = (resetLimit = true) => {
 
     let followBtn = '';
     let pokeBtn = '';
+    let msgBtn = '';
     let pokeStats = `<p class="text-xs text-gray-500 mt-1"><span class="text-orange-500"><i class="fa-solid fa-hand-point-right"></i> Total Pokes Received: ${uData.totalPokes || 0}</span></p>`;
 
     if(window.currentUser && window.currentUser.uid !== window.activeProfileUid) {
@@ -620,6 +621,7 @@ window.renderProfileData = (resetLimit = true) => {
         followBtn = `<button onclick="window.toggleFollow('${window.activeProfileUid}')" class="mt-3 ${isFollowing ? 'bg-gray-200 text-gray-600 dark:bg-slate-700 dark:text-gray-300' : 'bg-blue-600 text-white'} text-xs font-bold px-5 py-1.5 rounded-full transition shadow-sm">${isFollowing ? 'Following' : 'Follow'}</button>`;
         
         pokeBtn = `<button onclick="window.pokeUser('${window.activeProfileUid}')" class="mt-3 bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 border border-orange-200 dark:border-orange-800 text-xs font-bold px-5 py-1.5 rounded-full transition shadow-sm ml-2 hover:bg-orange-200 dark:hover:bg-orange-800"><i class="fa-solid fa-hand-point-right"></i> Poke</button>`;
+        msgBtn = `<button onclick="window.location.href='chat/index.html?dm=${window.activeProfileUid}'" class="mt-3 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold px-5 py-1.5 rounded-full transition shadow-sm ml-2" title="Message on Hangout Chat"><i class="fa-solid fa-comment-dots"></i> Message</button>`;
         pokeStats += `<p id="personal-poke-stats" class="text-[10px] text-gray-400 mt-0.5">Loading your pokes...</p>`;
         
         get(ref(db, `users/${window.activeProfileUid}/pokesFrom/${window.currentUser.uid}`)).then(snap => {
@@ -649,8 +651,8 @@ window.renderProfileData = (resetLimit = true) => {
                 <div class="absolute bottom-1 right-1 w-4 h-4 rounded-full border-2 border-white dark:border-slate-800 ${isOnline ? 'bg-green-500' : 'bg-gray-400'}"></div>
             </div>
             
-            <div class="flex items-center mt-3 justify-center flex-wrap">
-                <h2 class="text-xl font-bold dark:text-white flex items-center">${uData.name}</h2>
+            <div class="flex items-center justify-center flex-wrap mt-3 w-full px-5">
+                <h2 class="text-xl font-bold dark:text-white max-w-full text-center leading-tight" style="overflow-wrap:anywhere;">${uData.name}</h2>
                 ${role.badgeHtml} ${genderBadge}
             </div>
             
@@ -658,11 +660,12 @@ window.renderProfileData = (resetLimit = true) => {
             <p class="text-sm text-gray-500 mt-1"><span class="text-yellow-500">⭐ ${uData.points || 0}</span> • <span class="text-yellow-600 dark:text-yellow-500 ml-1">🏆 ${uData.lbPoints || 0}</span> • <span class="text-blue-500">👥 ${followerCount}</span> Followers</p>
             ${pokeStats}
             
-            ${uData.bio ? `<div class="mt-2 w-fit mx-auto px-3 py-2 rounded-lg bg-gray-50 dark:bg-slate-900/60 border-l-2 border-blue-400 dark:border-blue-500 text-[0.9rem] text-gray-600 dark:text-gray-300 italic text-center shadow-inner" style="line-height: 0.9;"><i class="fa-solid fa-quote-left text-blue-300 dark:text-blue-600 mr-1 text-[9px]"></i>${uData.bio}<i class="fa-solid fa-quote-right text-blue-300 dark:text-blue-600 ml-1 text-[9px]"></i></div>` : ''}
+            ${uData.bio ? `<div class="mt-2 w-fit mx-auto max-w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-slate-900/60 border-l-2 border-blue-400 dark:border-blue-500 text-[0.9rem] text-gray-600 dark:text-gray-300 italic text-center shadow-inner break-words" style="line-height: 0.9;"><i class="fa-solid fa-quote-left text-blue-300 dark:text-blue-600 mr-1 text-[9px]"></i>${uData.bio}<i class="fa-solid fa-quote-right text-blue-300 dark:text-blue-600 ml-1 text-[9px]"></i></div>` : ''}
             
             ${relStr}
-            <div class="flex items-center justify-center">
+            <div class="flex items-center justify-center flex-wrap gap-y-2">
                 ${followBtn}
+                ${msgBtn}
                 ${pokeBtn}
             </div>
         </div>
@@ -2363,7 +2366,7 @@ window.renderMembers = (resetLimit = true) => {
                 </div>
                 <div class="leading-tight truncate pr-2">
                     <div class="flex items-center">
-                        <h3 class="font-bold text-sm text-gray-900 dark:text-white truncate cursor-pointer hover:underline ${u.isBanned ? 'line-through text-red-500' : ''}" onclick="window.openProfile('${u.uid}')">${u.name}</h3>
+                        <h3 class="font-bold text-sm text-gray-900 dark:text-white truncate cursor-pointer hover:underline ${u.isBanned ? 'line-through text-red-500' : ''}" onclick="window.openProfile('${u.uid}')">${(u.name && u.name !== 'undefined') ? u.name : 'Unknown'}</h3>
                         ${window.getRole(u.uid).badgeHtml}
                         ${u.isBanned ? '<span class="bg-red-500 text-white text-[8px] font-bold px-1 ml-1 rounded">BANNED</span>' : ''}
                     </div>
@@ -2435,7 +2438,7 @@ window.showReactors = (postId, commentId = null) => {
             <div class="flex items-center justify-between p-2 rounded-lg mb-1 border border-gray-100 dark:border-slate-700/50 bg-gray-50 dark:bg-slate-900/50 hover:opacity-80 cursor-pointer transition" onclick="window.openProfile('${r.uid}'); document.getElementById('reactors-modal').classList.add('hidden');">
                 <div class="flex items-center space-x-2">
                     <img src="${u.pic || window.generateAvatar(r.uid)}" loading="lazy" class="w-8 h-8 rounded-full object-cover border border-gray-200 dark:border-slate-600">
-                    <span class="font-bold text-[13px] text-gray-900 dark:text-white">${u.name}</span>
+                    <span class="font-bold text-[13px] text-gray-900 dark:text-white">${(u.name && u.name !== 'undefined') ? u.name : 'Unknown'}</span>
                 </div>
                 <div class="text-base bg-white dark:bg-slate-800 min-w-[2rem] h-8 px-2 rounded-full flex items-center justify-center shadow-sm border border-gray-100 dark:border-slate-700 shrink-0">${icons[r.type] || `<span class="text-sm">${r.type}</span>`}</div>
             </div>

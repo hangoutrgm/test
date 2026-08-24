@@ -1,0 +1,17 @@
+[
+  { "q": "What is the largest planet in our solar system?", "a": ["jupiter"], "choices": ["Mars", "Jupiter", "Venus", "Saturn"] },
+  { "q": "How many continents are there?", "a": ["7", "seven"], "choices": ["5", "6", "7", "8"] },
+  { "q": "What gas do plants absorb from the air?", "a": ["carbon dioxide", "co2"], "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Helium"] },
+  { "q": "Which ocean is the biggest?", "a": ["pacific"], "choices": ["Atlantic", "Indian", "Arctic", "Pacific"] },
+  { "q": "What is the capital of Japan?", "a": ["tokyo"], "choices": ["Osaka", "Kyoto", "Tokyo", "Seoul"] },
+  { "q": "How many sides does a hexagon have?", "a": ["6", "six"], "choices": ["5", "6", "7", "8"] },
+  { "q": "Which metal is liquid at room temperature?", "a": ["mercury"], "choices": ["Lead", "Mercury", "Tin", "Zinc"] },
+  { "q": "What is the tallest animal in the world?", "a": ["giraffe"], "choices": ["Elephant", "Giraffe", "Horse", "Camel"] },
+  { "q": "How many minutes are in a full day?", "a": ["1440"], "choices": ["1240", "1340", "1440", "1540"] },
+  { "q": "Which planet is known as the Red Planet?", "a": ["mars"], "choices": ["Venus", "Mars", "Mercury", "Neptune"] },
+  { "q": "What do bees collect from flowers?", "a": ["nectar", "pollen"], "choices": ["Nectar", "Sap", "Dew", "Seeds"] },
+  { "q": "Which country invented paper?", "a": ["china"], "choices": ["Egypt", "China", "Greece", "India"] },
+  { "q": "What is the hardest natural substance?", "a": ["diamond"], "choices": ["Gold", "Iron", "Diamond", "Quartz"] },
+  { "q": "How many strings does a standard guitar have?", "a": ["6", "six"], "choices": ["4", "5", "6", "7"] },
+  { "q": "Which is the fastest land animal?", "a": ["cheetah"], "choices": ["Lion", "Horse", "Cheetah", "Ostrich"] }
+]

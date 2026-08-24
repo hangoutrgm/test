@@ -1,6 +1,16 @@
 import { auth, db, cloudinaryConfig } from '../../js/firebase-config.js';
 import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, updateProfile, signInAnonymously, GoogleAuthProvider, signInWithPopup } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
 import { endBefore, get, limitToLast, onDisconnect, onValue, orderByKey, push, query, ref, remove, runTransaction, set, update, onChildAdded, onChildChanged, onChildRemoved } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
+import '../games/index.js?v=9';
+
+// Chat-games context: name lookup, active thread, toasts
+if (window.ChatGames) {
+  window.ChatGames.init({
+    getThreadId: () => state.activeThreadId,
+    getName: (uid) => state.users[uid]?.name || getNickname(uid),
+    toast: showToast,
+  });
+}
 
 // Dynamic settings — loaded from Firebase /settings, falls back to safe defaults
 const chatSettings = { chatImageLimit: 10, chatVideoLimit: 3, chatVoiceLimit: 10, chatVideoSizeLimitMB: 20, chatCooldownSec: 60 };
@@ -328,8 +338,10 @@ function renderMessages(rawMessages, jumpToLatest = false) {
       isVid = message.image.includes('/video/upload/') || message.image.match(/\\.(mp4|webm|mov|ogg)$/i);
       image = isVid ? `<video class="message-image" src="${escapeHtml(message.image)}" style="max-height:200px; max-width: 100%; border-radius: 8px; margin-top: 4px;"></video>` : `<img class="message-image" src="${escapeHtml(message.image)}" alt="Shared photo">`;
     }
-    let messageText = linkifyText(message.text || '');
-    if (!messageText && image) {
+    const isGameCard = Boolean(message.isGame && window.ChatGames);
+    if (isGameCard) { quote = ''; image = ''; audioHtml = ''; }
+    let messageText = isGameCard ? window.ChatGames.renderBody(message) : linkifyText(message.text || '');
+    if (!isGameCard && !messageText && image) {
       messageText = `<div style="font-style:italic; opacity:0.7; font-size:14px; margin-bottom:4px;">Shared a ${isVid ? 'video' : 'photo'}</div>`;
     } else if (!messageText && isVoice) {
       messageText = `<div style="font-style:italic; opacity:0.7; font-size:14px; margin-bottom:4px;">Voice message</div>`;
@@ -354,7 +366,7 @@ function renderMessages(rawMessages, jumpToLatest = false) {
     }
     
     const senderNameHtml = (state.activeInboxItem?.isGroup && !mine) ? `<div class="message-sender-name" style="font-size:10.5px; color:var(--ink-muted); margin-bottom:2px; margin-left:6px; font-weight:600;">${escapeHtml(getNickname(message.senderId))}</div>` : '';
-    return `<div id="message-${escapeHtml(message.id)}" class="message-row${mine ? ' me' : ''}"><div>${senderNameHtml}<div class="message-bubble" data-message="${escapeHtml(message.id)}"><span class="swipe-reply-hint"><svg viewBox="0 0 24 24"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></span>${quote}${messageText}${image}${audioHtml}</div>${reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}<div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div></div></div>`;
+    return `<div id="message-${escapeHtml(message.id)}" class="message-row${mine ? ' me' : ''}${isGameCard ? ' is-game-row' : ''}"><div>${senderNameHtml}<div class="message-bubble${isGameCard ? ' is-game-bubble' : ''}" data-message="${escapeHtml(message.id)}">${isGameCard ? '' : '<span class="swipe-reply-hint"><svg viewBox="0 0 24 24"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></span>'}${quote}${messageText}${image}${audioHtml}</div>${!isGameCard && reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}<div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div></div></div>`;
   }).join('');
   // Prepend load-more header
   let header = list.querySelector('.load-more-header');
@@ -402,7 +414,7 @@ menuSvg.edit = '<svg viewBox="0 0 24 24"><path d="M4 20h4L20 8a2.1 2.1 0 0 0-4-4
 menuSvg.delete = '<svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>';
 
 function showMessageMenu(message, x, y, fromLongPress = false) {
-  if (!message) return;
+  if (!message || message.isGame) return; // no react/reply menu on game cards
   const menu = $('message-action-menu');
 
   // Quick-set reaction buttons
@@ -545,7 +557,7 @@ function closeImageViewer() {
 function wireMessageGestures(rows) {
   $('message-list').querySelectorAll('.message-bubble').forEach((bubble) => {
     const message = rows.find((row) => row.id === bubble.dataset.message);
-    if (!message) return;
+    if (!message || message.isGame) return; // game cards have their own buttons
     let pressTimer = null;
     let singleTapTimer = null;
     let longPressed = false;
@@ -1670,6 +1682,7 @@ get(ref(db, 'users')).then((snapshot) => {
 onValue(ref(db, 'presence'), (snapshot) => { state.online = snapshot.val() || {}; renderConversations(); renderPeople(); updateChatHeader(); }, (error) => reportRealtimeError('presence', error));
 onValue(ref(db, '.info/connected'), (snapshot) => { state.connected = snapshot.val() === true; if (state.connected) startOwnPresence(); });
 let checkedInvite = false;
+let checkedDmParam = false;
 onAuthStateChanged(auth, async (user) => {
   const previousUser = state.user; if (previousUser && previousUser.uid !== user?.uid) stopOwnPresence(previousUser);
   state.user = user; if (state.stopInbox) state.stopInbox(); if (state.stopClears) state.stopClears(); if (state.stopPostsNotif) { state.stopPostsNotif(); state.stopPostsNotif = null; } stopThreadSummaryWatchers(); state.inbox = {}; state.clears = {}; state.inboxReady = false;
@@ -1734,6 +1747,23 @@ onAuthStateChanged(auth, async (user) => {
       if (unread > 0) { badge.textContent = unread > 99 ? '99+' : unread; badge.classList.remove('hidden'); }
       else { badge.classList.add('hidden'); }
     });
+    // Deep link from Hangout Posts profile "Message" button: chat/?dm=<peerUid>
+    if (!checkedDmParam) {
+      const dmPeer = new URLSearchParams(window.location.search).get('dm');
+      if (dmPeer && dmPeer !== user.uid) {
+        checkedDmParam = true;
+        window.history.replaceState({}, document.title, window.location.origin + window.location.pathname);
+        try {
+          if (!state.users[dmPeer]) {
+            const ps = await get(ref(db, `users/${dmPeer}`));
+            if (ps.exists()) state.users[dmPeer] = ps.val();
+          }
+          setTimeout(() => startConversation(dmPeer), 400); // brief pause so the inbox listener attaches first
+        } catch (e) { console.warn('DM deep-link failed:', e); showToast('Could not open that conversation.'); }
+      } else {
+        checkedDmParam = true;
+      }
+    }
   } else closeActiveChat();
   syncAuthUi(); updateUnreadTitle();
 });
@@ -1891,7 +1921,7 @@ $('set-nickname-button')?.addEventListener('click', async () => {
   if (!peerIds.length) return;
   const targetUid = peerIds[0]; const targetUser = state.users[targetUid];
   if (!targetUser) return;
-  const newNickname = await showAppModal({ title: 'Set Nickname', message: `Set a nickname for ${targetUser.name}. Leave blank to reset.`, input: true, inputValue: state.activeInboxItem.nicknames?.[targetUid] || '' });
+  const newNickname = await showAppModal({ title: 'Set Nickname', message: `Set a nickname for ${targetUser.name || 'this member'}. Leave blank to reset.`, input: true, inputValue: state.activeInboxItem.nicknames?.[targetUid] || '' });
   if (newNickname === null) return;
   try {
     await update(ref(db, `chatThreads/${state.activeThreadId}/nicknames`), { [targetUid]: newNickname.trim() || null });
@@ -2127,7 +2157,7 @@ $('attach-voice-item')?.addEventListener('click', () => {
 });
 $('attach-game-item')?.addEventListener('click', () => {
   $('attach-menu')?.classList.add('hidden');
-  showToast('🎮 Hangout Mini-Games are coming in the next update!');
+  window.ChatGames?.openPicker();
 });
 
 $('voice-rec-stop')?.addEventListener('click', stopVoiceRecording);
