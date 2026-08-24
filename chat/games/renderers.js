@@ -181,9 +181,19 @@ const mineBody = (mid, g) => {
 };
 
 // ── Status fragments ──
-const waitingJoin = (g, uid) => uid === g.hostId
-  ? '<div class="cg-note">⏳ Waiting for challenger…</div>'
-  : `<button type="button" class="cg-btn-join" onclick="window.ChatGames.join('${g._mid}')">🎮 Accept Challenge & Join</button>`;
+const waitingJoin = (g, uid) => {
+  const seated = Object.keys(g.players || {}).length;
+  if (uid === g.hostId) {
+    // Connect-4 seats three, but the host can start as soon as two have joined
+    if (g.type === 'connect4' && seated >= 2) {
+      return `<button type="button" class="cg-btn-join" onclick="window.ChatGames.start('${g._mid}')">▶ Start now (${seated}/3)</button>
+        <div class="cg-note">Or keep waiting for a third player.</div>`;
+    }
+    return `<div class="cg-note">⏳ Waiting for challenger…${g.type === 'connect4' ? ` (${seated}/3)` : ''}</div>`;
+  }
+  if (g.players?.[uid]) return '<div class="cg-note">⏳ Waiting for the table to fill…</div>';
+  return `<button type="button" class="cg-btn-join" onclick="window.ChatGames.join('${g._mid}')">🎮 Accept Challenge & Join</button>`;
+};
 
 const scoreFooter = (g) => {
   const entries = Object.entries(g.finalScores || g.scores || {});
@@ -203,6 +213,7 @@ const SHELL = {
 
 export const renderBody = (msg) => {
   const g = msg.game || {};
+  if (!g.type && msg.gameType) g.type = msg.gameType; // new-style stub messages carry the type
   const mid = msg.id;
   const uid = me();
   g._mid = mid;

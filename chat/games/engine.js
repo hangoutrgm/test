@@ -1,7 +1,7 @@
 // ============================================================
 // chat/games/engine.js — creation, RTDB sync, actions, win logic
 // ============================================================
-import { ref, push, get, set, update, runTransaction } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
+import { ref, push, get, set, update, runTransaction, onValue } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
 import { getAuth } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
 import { db } from '../../js/firebase-config.js';
 import { GAME_META, pick } from './helpers.js?v=5';
@@ -14,9 +14,18 @@ export const setThreadGetter = (fn) => { _getThreadId = fn; };
 // Host-input providers (wired by index.js — e.g. the Hangman setup modal)
 let _hostInputs = {};
 export const setHostInputs = (h) => { _hostInputs = { ..._hostInputs, ...h }; };
+// Admin-configurable runtime (/config → settings) — wired from app.js via index.js
+let _getSettings = () => ({});
+export const setSettingsGetter = (fn) => { if (typeof fn === 'function') _getSettings = fn; };
+const roundCount = () => {
+  const n = Number(_getSettings().chatGameRounds);
+  return Number.isFinite(n) && n >= 1 ? Math.min(20, Math.floor(n)) : ROUNDS_PER_GAME;
+};
 const tid = () => _getThreadId();
 const me = () => getAuth().currentUser?.uid;
-const gRef = (mid) => ref(db, `chatMessages/${tid()}/${mid}/game`);
+// Live game state lives OUTSIDE the messages node (/chatGames) to keep chatMessages light.
+// Messages only carry a lightweight stub: { isGame:true, gameType }.
+const gRef = (mid) => ref(db, `chatGames/${tid()}/${mid}`);
 
 // ── Config bank loaders (posts-side JSON, cached) ──
 let _flags = null, _riddles = null, _elements = null, _emojiBank = null, _trivia = null, _jumbled = null;
@@ -122,7 +131,7 @@ const buildGame = async (type) => {
       return { ...base, status: 'active' };      // one big MINE button — first tap wins
     case 'quiz': {
       const rounds = [];
-      for (let i = 0; i < ROUNDS_PER_GAME; i++) {
+      for (let i = 0; i < roundCount(); i++) {
         if (type === 'trivia') { const t = triviaRound(await loadTrivia()); if (t) rounds.push({ q: t.q, a: t.a, choices: t.choices }); }
         else if (type === 'math') { const m = mathRound(i); rounds.push({ q: m.q, a: [m.a] }); }
         else if (type === 'jumbled') { const j = jumbledRound(await loadJumbledWords()); rounds.push({ q: j.q, a: [j.a] }); }
@@ -154,15 +163,44 @@ const buildGame = async (type) => {
 // ── Push the game message into the thread ──
 export const createGame = async (type) => {
   const threadId = tid();
-  if (!threadId || !me()) return;
+  const uid = me();
+  if (!threadId || !uid) return;
   const meta = GAME_META[type];
   if (!meta) return;
+
+  // Cooldown between starting games (/config → Chat Game Start, seconds; 0 = off)
+  const cd = Number(_getSettings().chatGameCooldownSec ?? 0);
+  if (cd > 0) {
+    const snap = await get(ref(db, `users/${uid}/lastChatGameAt`)).catch(() => null);
+    const waitMs = cd * 1000 - (Date.now() - Number(snap?.val() || 0));
+    if (waitMs > 0) {
+      const err = new Error('cooldown');
+      err.cooldownWait = Math.ceil(waitMs / 1000);
+      throw err;
+    }
+  }
+
   let game;
-  try { game = await buildGame(type); } catch (e) { console.warn('[ChatGames] build failed:', e); return; }
+  try { game = await buildGame(type); }
+  catch (e) {
+    if (e && e.message === 'cancelled') return; // host closed the setup modal — not an error
+    console.warn('[ChatGames] build failed:', e);
+    return;
+  }
   const text = `${meta.icon} ${meta.name}`;
-  await push(ref(db, `chatMessages/${threadId}`), {
-    senderId: me(), timestamp: Date.now(), text, isGame: true, game,
+
+  // Two-phase write: reserve the message key first, store the full game in its own
+  // /chatGames node, then drop a lightweight stub message that references it by key.
+  const mRef = push(ref(db, `chatMessages/${threadId}`));
+  await set(ref(db, `chatGames/${threadId}/${mRef.key}`), game);
+  await set(mRef, {
+    senderId: uid,
+    timestamp: Date.now(),
+    text,
+    isGame: true,
+    gameType: type,
   });
+  update(ref(db, 'users/' + uid), { lastChatGameAt: Date.now() });
 };
 
 // ── Board helpers ──
@@ -202,6 +240,18 @@ export const joinGame = async (mid) => {
     const marks = g.type === 'connect4' ? ['Y', 'G'] : ['O'];
     g.players[uid] = marks[Object.keys(g.players).length - 1] || marks[marks.length - 1];
     if (Object.keys(g.players).length >= need) { g.status = 'active'; g.turn = g.hostId; }
+    return g;
+  });
+};
+
+/** Connect-4: host may start early once 2 of the 3 seats are filled. */
+export const startNow = async (mid) => {
+  const uid = me(); if (!uid) return;
+  await runTransaction(gRef(mid), (g) => {
+    if (!g || g.status !== 'waiting' || g.type !== 'connect4') return g;
+    if (uid !== g.hostId || Object.keys(g.players || {}).length < 2) return g;
+    g.status = 'active';
+    g.turn = g.hostId;
     return g;
   });
 };
@@ -329,7 +379,7 @@ export const submitGuess = async (mid, value) => {
     // Wrong choice click → record the miss so this player is locked out of the current round
     if (round.choices) {
       await runTransaction(
-        ref(db, `chatMessages/${tid()}/${mid}/game/attempts/${idx}/${uid}`),
+        ref(db, `chatGames/${tid()}/${mid}/attempts/${idx}/${uid}`),
         (cur) => (cur ? undefined : true),
       ).catch(() => {});
     }
@@ -337,7 +387,7 @@ export const submitGuess = async (mid, value) => {
   }
 
   // Claim this round atomically — only the first correct solver scores.
-  const claim = await runTransaction(ref(db, `chatMessages/${tid()}/${mid}/game/solved/${idx}`), (cur) => (cur ? undefined : uid));
+  const claim = await runTransaction(ref(db, `chatGames/${tid()}/${mid}/solved/${idx}`), (cur) => (cur ? undefined : uid));
   if (!claim.committed) return;
 
   await runTransaction(gRef(mid), (gg) => {
@@ -365,4 +415,7 @@ export const submitGuess = async (mid, value) => {
 export const closeGame = async (mid) => {
   if (me()) await update(gRef(mid), { status: 'closed' });
 };
+
+/** Live-subscribe to a game's state — used by app.js for out-of-message game cards. */
+export const watchGame = (mid, cb) => onValue(gRef(mid), (s) => cb(s.val()), () => cb(null));
 

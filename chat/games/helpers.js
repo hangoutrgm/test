@@ -64,7 +64,7 @@ export const fetchJson = async (relPath) => {
 // ── Game registry metadata (single source for the picker + titles) ──
 export const GAME_META = {
   tictactoe:    { name: 'Tic-Tac-Toe',        icon: '⭕',  family: 'board',     hint: 'Best of one — 3 in a row wins' },
-  connect4:     { name: 'Connect 4',          icon: '🔴',  family: 'board',     hint: '3 players — line up 4 to win' },
+  connect4:     { name: 'Connect 4',          icon: '🔴',  family: 'board',     hint: '2–3 players — line up 4 to win' },
   hangman:      { name: 'Hangman',            icon: '🔤',  family: 'hangman',   hint: 'You pick the word — they guess letters' },
   first_to_mine:{ name: 'First to Mine',      icon: '💎',  family: 'mine',      hint: 'One tap — fastest miner wins' },
   trivia:       { name: 'Trivia',             icon: '🧠',  family: 'quiz',      hint: '5 rounds of general knowledge' },

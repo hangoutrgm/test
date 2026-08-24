@@ -1,7 +1,7 @@
 import { auth, db, cloudinaryConfig } from '../../js/firebase-config.js';
 import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, updateProfile, signInAnonymously, GoogleAuthProvider, signInWithPopup } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js';
 import { endBefore, get, limitToLast, onDisconnect, onValue, orderByKey, push, query, ref, remove, runTransaction, set, update, onChildAdded, onChildChanged, onChildRemoved } from 'https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js';
-import '../games/index.js?v=9';
+import '../games/index.js?v=13';
 
 // Chat-games context: name lookup, active thread, toasts
 if (window.ChatGames) {
@@ -9,11 +9,12 @@ if (window.ChatGames) {
     getThreadId: () => state.activeThreadId,
     getName: (uid) => state.users[uid]?.name || getNickname(uid),
     toast: showToast,
+    getSettings: () => chatSettings,
   });
 }
 
 // Dynamic settings — loaded from Firebase /settings, falls back to safe defaults
-const chatSettings = { chatImageLimit: 10, chatVideoLimit: 3, chatVoiceLimit: 10, chatVideoSizeLimitMB: 20, chatCooldownSec: 60 };
+const chatSettings = { chatImageLimit: 10, chatVideoLimit: 3, chatVoiceLimit: 10, chatVideoSizeLimitMB: 20, chatCooldownSec: 60, chatGameRounds: 5, chatGameCooldownSec: 60 };
 let sitePaused = false; // Site Control (/config): when true, only admins can send messages
 onValue(ref(db, 'settings'), (snap) => {
   if (snap.exists()) {
@@ -23,6 +24,8 @@ onValue(ref(db, 'settings'), (snap) => {
     chatSettings.chatVoiceLimit = s.chatVoiceLimit ?? 10;
     chatSettings.chatVideoSizeLimitMB = s.chatVideoSizeLimitMB ?? 20;
     chatSettings.chatCooldownSec = s.chatCooldownSec ?? 60;
+    chatSettings.chatGameRounds = s.chatGameRounds ?? 5;
+    chatSettings.chatGameCooldownSec = s.chatGameCooldownSec ?? 60;
     sitePaused = s.pauseChat === true;
   } else {
     sitePaused = false;
@@ -284,6 +287,39 @@ function visibleMessages(rawMessages = state.messages) {
   return Object.entries(rawMessages || {}).map(([id, message]) => ({ id, ...message })).filter((message) => Number(message.timestamp || 0) > clearTime).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 }
 
+// ── Live game-card watchers: game state lives in /chatGames, not inside messages ──
+function detachGameWatchers() {
+  (state.stopGameWatchers || []).forEach((off) => { try { off(); } catch (_) {} });
+  state.stopGameWatchers = [];
+}
+function attachGameWatchers() {
+  detachGameWatchers();
+  if (!state.activeThreadId || !window.ChatGames?.watch) return;
+  // Derive message ids from the rendered containers themselves — raw state.messages
+  // values don't carry their own key as .id.
+  document.querySelectorAll('[id^="cg-body-"]').forEach((el) => {
+    const mid = el.id.slice('cg-body-'.length);
+    if (!mid) return;
+    const base = { ...(state.messages[mid] || {}), id: mid };
+    const off = window.ChatGames.watch(mid, (g) => {
+      const live = document.getElementById('cg-body-' + mid);
+      if (!live) return;
+      try {
+        live.innerHTML = g
+          ? window.ChatGames.renderBody({ ...base, game: g })
+          : '<div class="cg-note">🎮 Game unavailable</div>';
+        // Keep the view pinned to the newest content when the user is near the bottom —
+        // game cards grow after their state loads, which would otherwise shift the view.
+        const list = document.getElementById('message-list');
+        if (list && list.scrollHeight - list.scrollTop - list.clientHeight < 500) {
+          requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
+        }
+      } catch (e) { console.warn('[ChatGames] card render failed:', e); }
+    });
+    state.stopGameWatchers.push(off);
+  });
+}
+
 function renderMessages(rawMessages, jumpToLatest = false) {
   if (rawMessages !== undefined) state.messages = rawMessages || {};
   const list = $('message-list');
@@ -307,7 +343,11 @@ function renderMessages(rawMessages, jumpToLatest = false) {
       }
     });
   }
-  list.innerHTML = rows.map((message) => {
+  state._rowCache = state._rowCache || {};
+  const rowHtml = [];
+  const rowSig = {};
+  const sigOf = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return 'h' + h; };
+  const htmlArr = rows.map((message) => {
     if (message.isSystem) return `<div id="message-${escapeHtml(message.id)}" class="system-message-row"><span class="system-message-bubble">${escapeHtml(getNickname(message.senderId))} ${escapeHtml(message.text)}</span></div>`;
     const mine = message.senderId === state.user?.uid;
     const reactionSummary = Object.entries(message.reactions || {}).map(([type, people]) => Object.keys(people || {}).length ? `<span class="reaction-chip">${reactions[type] || type || '👍'} ${Object.keys(people).length}</span>` : '').join('');
@@ -339,8 +379,17 @@ function renderMessages(rawMessages, jumpToLatest = false) {
       image = isVid ? `<video class="message-image" src="${escapeHtml(message.image)}" style="max-height:200px; max-width: 100%; border-radius: 8px; margin-top: 4px;"></video>` : `<img class="message-image" src="${escapeHtml(message.image)}" alt="Shared photo">`;
     }
     const isGameCard = Boolean(message.isGame && window.ChatGames);
+    let gameCardHtml = '';
+    if (isGameCard) {
+      // Legacy games (stored inside the message) render statically; new-style stubs
+      // get a container that a live /chatGames watcher fills in.
+      const legacyInline = message.game && Object.keys(message.game).length > 0;
+      gameCardHtml = legacyInline
+        ? window.ChatGames.renderBody(message)
+        : `<div id="cg-body-${escapeHtml(message.id)}"><div class="cg-note">🎮 Loading game…</div></div>`;
+    }
     if (isGameCard) { quote = ''; image = ''; audioHtml = ''; }
-    let messageText = isGameCard ? window.ChatGames.renderBody(message) : linkifyText(message.text || '');
+    let messageText = isGameCard ? gameCardHtml : linkifyText(message.text || '');
     if (!isGameCard && !messageText && image) {
       messageText = `<div style="font-style:italic; opacity:0.7; font-size:14px; margin-bottom:4px;">Shared a ${isVid ? 'video' : 'photo'}</div>`;
     } else if (!messageText && isVoice) {
@@ -367,7 +416,36 @@ function renderMessages(rawMessages, jumpToLatest = false) {
     
     const senderNameHtml = (state.activeInboxItem?.isGroup && !mine) ? `<div class="message-sender-name" style="font-size:10.5px; color:var(--ink-muted); margin-bottom:2px; margin-left:6px; font-weight:600;">${escapeHtml(getNickname(message.senderId))}</div>` : '';
     return `<div id="message-${escapeHtml(message.id)}" class="message-row${mine ? ' me' : ''}${isGameCard ? ' is-game-row' : ''}"><div>${senderNameHtml}<div class="message-bubble${isGameCard ? ' is-game-bubble' : ''}" data-message="${escapeHtml(message.id)}">${isGameCard ? '' : '<span class="swipe-reply-hint"><svg viewBox="0 0 24 24"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></span>'}${quote}${messageText}${image}${audioHtml}</div>${!isGameCard && reactionSummary ? `<div class="reaction-summary">${reactionSummary}</div>` : ''}<div class="message-meta"><div class="message-time hidden">${formatTime(message.timestamp)}</div>${message.editedAt ? '<span class="edited-label">Edited</span>' : ''}${seen}</div></div></div>`;
-  }).join('');
+  }).forEach((html, i) => {
+    const key = 'message-' + rows[i].id;
+    rowHtml[key] = html;
+    rowSig[key] = sigOf(html);
+  });
+
+  // ── Aggressive DOM cache: reconcile per-row instead of rebuilding the list.
+  // Unchanged rows are left completely untouched → no flicker, stable scroll,
+  // and live-filled game cards are never wiped by unrelated re-renders.
+  const staleWrap = list.querySelector('.msg-skeleton-list, .list-empty');
+  if (staleWrap) { staleWrap.remove(); state._rowCache = {}; }
+  Object.keys(state._rowCache).forEach((key) => {
+    if (!rowSig[key]) { document.getElementById(key)?.remove(); delete state._rowCache[key]; }
+  });
+  rows.forEach((message, i) => {
+    const key = 'message-' + message.id;
+    const html = rowHtml[key] || '';
+    const el = document.getElementById(key);
+    if (el && state._rowCache[key] === rowSig[key]) return; // cached — skip entirely
+    if (el) { el.outerHTML = html; }                        // changed → swap in place
+    else {                                                  // new → insert at the right spot
+      const t = document.createElement('template');
+      t.innerHTML = html.trim();
+      const node = t.content.firstElementChild;
+      const nxt = rows[i + 1] ? document.getElementById('message-' + rows[i + 1].id) : null;
+      if (nxt && nxt.parentNode === list) list.insertBefore(node, nxt);
+      else list.appendChild(node);
+    }
+    state._rowCache[key] = rowSig[key];
+  });
   // Prepend load-more header
   let header = list.querySelector('.load-more-header');
   if (!header) {
@@ -384,6 +462,7 @@ function renderMessages(rawMessages, jumpToLatest = false) {
   }
 
   wireMessageGestures(rows);
+  attachGameWatchers();
   if (jumpToLatest || wasNearLatest || window._jumpToLatest || isNewArrival) {
     requestAnimationFrame(() => { 
       list.scrollTop = list.scrollHeight; 
@@ -558,6 +637,8 @@ function wireMessageGestures(rows) {
   $('message-list').querySelectorAll('.message-bubble').forEach((bubble) => {
     const message = rows.find((row) => row.id === bubble.dataset.message);
     if (!message || message.isGame) return; // game cards have their own buttons
+    if (bubble.dataset.gw === '1') return;  // cached row — gestures already wired
+    bubble.dataset.gw = '1';
     let pressTimer = null;
     let singleTapTimer = null;
     let longPressed = false;
@@ -1055,6 +1136,7 @@ function openThread(threadId, inboxItem) {
   state.loadingOldMessages = false;
   $('empty-state').classList.add('hidden'); $('active-chat').classList.remove('hidden'); updateChatHeader(); renderConversations(); markThreadRead(threadId);
   if (state.stopMessages) state.stopMessages();
+  detachGameWatchers();
   state.messages = {}; state.messagesLoaded = false;
   $('message-list').innerHTML = `<div class="msg-skeleton-list">
     <div class="msg-skeleton-row"><div class="msg-skeleton-avatar skeleton"></div><div class="msg-skeleton-body"><div class="msg-skeleton-bubble skeleton"></div><div class="msg-skeleton-time skeleton"></div></div></div>

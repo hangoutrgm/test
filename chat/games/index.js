@@ -2,8 +2,8 @@
 // chat/games/index.js — public API + picker wiring
 // Exposes window.ChatGames used by app.js and inline onclicks.
 // ============================================================
-import * as engine from './engine.js?v=6';
-import { renderBody, pickerHtml, setContext } from './renderers.js?v=12';
+import * as engine from './engine.js?v=9';
+import { renderBody, pickerHtml, setContext } from './renderers.js?v=14';
 import { GAME_META } from './helpers.js?v=5';
 
 let _getThreadId = () => null;
@@ -142,16 +142,27 @@ engine.setHostInputs({
 
 window.ChatGames = {
   /** Called once by chat app.js to provide context hooks. */
-  init: ({ getThreadId, getName, toast }) => {
+  init: ({ getThreadId, getName, toast, getSettings }) => {
     if (typeof getThreadId === 'function') { _getThreadId = getThreadId; engine.setThreadGetter(getThreadId); }
     setContext({ getName });
     if (typeof toast === 'function') _toast = toast;
+    if (typeof getSettings === 'function') engine.setSettingsGetter(getSettings);
   },
   openPicker,
   renderBody,
-  create: async (type) => { if (ensureThread()) await engine.createGame(type); },
+  /** Live-subscribe to a game card's state (out-of-message storage). */
+  watch: (mid, cb) => engine.watchGame(mid, cb),
+  create: async (type) => {
+    if (!ensureThread()) return;
+    try { await engine.createGame(type); }
+    catch (err) {
+      if (err && err.cooldownWait) _toast(`Please wait ${err.cooldownWait}s before starting another game.`);
+      else { console.error(err); _toast('Could not start that game.'); }
+    }
+  },
   move: (mid, idx) => engine.playMove(mid, idx),
   join: (mid) => engine.joinGame(mid),
+  start: (mid) => engine.startNow(mid),
   guessLetter: (mid, L) => engine.guessLetter(mid, L),
   guessWord: (mid, value) => engine.guessWord(mid, value),
   mine: async (mid) => {
